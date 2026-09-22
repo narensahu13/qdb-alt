@@ -1,8 +1,12 @@
-# Register a nightly harvest that continues until every section is complete.
-# Run this once, from an elevated PowerShell if you want it to run while
-# logged out:
+# Register a nightly harvest that continues until every section is complete,
+# and keeps the store current after that. Run this once:
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\install-task.ps1
+#
+# The task runs as you, while you are signed in. A locked screen is fine;
+# signing out stops it. (Running whether signed in or not needs a stored
+# password or an S4U principal, which this script does not set up -- an
+# S4U task may also be unable to authenticate to a corporate proxy.)
 #
 # Closing the laptop lid usually sleeps Windows, which stops the job. Set
 # "When I close the lid" to "Do nothing" while plugged in, or run this on a

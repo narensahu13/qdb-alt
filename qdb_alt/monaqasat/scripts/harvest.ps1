@@ -43,13 +43,18 @@ function Invoke-LoggedPython([string]$arguments) {
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $proc = [System.Diagnostics.Process]::Start($psi)
+    # Drain stderr in the background while stdout is read line by line.
+    # Reading stderr only after stdout has ended deadlocks as soon as Python
+    # writes more than a pipe buffer to stderr (a long traceback does):
+    # Python blocks on stderr, so stdout never ends.
+    $errTask = $proc.StandardError.ReadToEndAsync()
     while (-not $proc.StandardOutput.EndOfStream) {
         $line = $proc.StandardOutput.ReadLine()
         if ($null -ne $line) { Write-Log $line }
     }
-    $err = $proc.StandardError.ReadToEnd()
-    if ($err) { Write-Log $err.TrimEnd() }
     $proc.WaitForExit()
+    $err = $errTask.Result
+    if ($err) { Write-Log $err.TrimEnd() }
     return $proc.ExitCode
 }
 
