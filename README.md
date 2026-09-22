@@ -17,6 +17,22 @@ What changed on 22 Sept 2026 and why -- matching, CR numbers, section
 updates, features -- is in
 [`qdb_alt/monaqasat/FIXES.md`](qdb_alt/monaqasat/FIXES.md).
 
+The live database is about 1 GB because every fetched page is stored as HTML.
+GitHub rejects any file over 100 MB, so that file stays on the machine that
+crawled it. `data/monaqasat.slim.db` is the same database with the HTML
+removed (about 20 MB): tenders, companies, and crawl progress. On the work
+laptop:
+
+```powershell
+cd qdb_alt\monaqasat
+copy data\monaqasat.slim.db monaqasat.db
+python -m monaqasat status
+python -m monaqasat harvest --max-hours 12
+```
+
+Refresh the snapshot after a harvest with `python -m monaqasat pack`. The
+working `monaqasat.db` (with HTML) is gitignored.
+
 To keep extracting overnight without leaving the laptop lid-open in front of
 you: `scripts\install-task.ps1` registers a nightly Windows task. Set lid-close
 to **Do nothing** while plugged in, or run it on a VM that stays on.

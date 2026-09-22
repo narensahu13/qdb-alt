@@ -22,6 +22,7 @@ How a tender's state is kept (see FIXES.md, "state model"):
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -298,6 +299,51 @@ def companies_ref(tender_id: str, state: str | None) -> str:
     """Failure key for a companies page: per tender *and* state, so a page
     that kept failing before the award gets a fresh start after it."""
     return f"{tender_id}@{state or ''}"
+
+
+def pack_database(src: str, dest: str) -> int:
+    """Copy the database without stored HTML.
+
+    raw_page is almost all of the file size (the pages themselves). Crawl
+    progress, tenders and companies live in the other tables, so a laptop
+    can resume from the packed copy. Returns the new file size in bytes.
+    """
+    src_path = Path(src).resolve()
+    dest_path = Path(dest).resolve()
+    if src_path == dest_path:
+        raise ValueError("pack destination must be a different file")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if dest_path.exists():
+        dest_path.unlink()
+    src_conn = sqlite3.connect(f"file:{src_path.as_posix()}?mode=ro", uri=True)
+    dst = sqlite3.connect(dest_path)
+    try:
+        dst.execute("PRAGMA journal_mode=OFF")
+        dst.execute("PRAGMA synchronous=OFF")
+        objects = src_conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL "
+            "AND name NOT LIKE 'sqlite_%' AND type IN ('table','index') "
+            "ORDER BY type DESC"
+        ).fetchall()
+        for _name, sql in objects:
+            dst.execute(sql)
+        tables = [
+            name for name, sql in objects
+            if sql.lstrip().upper().startswith("CREATE TABLE")
+            and name != "raw_page"
+        ]
+        dst.execute("ATTACH DATABASE ? AS src", (str(src_path),))
+        for name in tables:
+            dst.execute(f'INSERT INTO "{name}" SELECT * FROM src."{name}"')
+        version = dst.execute("PRAGMA src.user_version").fetchone()[0]
+        dst.execute(f"PRAGMA user_version = {version}")
+        dst.commit()
+        dst.execute("DETACH DATABASE src")
+        dst.execute("VACUUM")
+    finally:
+        dst.close()
+        src_conn.close()
+    return dest_path.stat().st_size
 
 
 class Store:

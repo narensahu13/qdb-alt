@@ -12,6 +12,7 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+!qdb_alt/monaqasat/data/monaqasat.slim.db
 logs/
 *.log
 .DS_Store

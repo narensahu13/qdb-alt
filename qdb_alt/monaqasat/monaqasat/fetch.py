@@ -148,7 +148,11 @@ def decode_body(resp) -> str:
     """
     ctype = str(resp.headers.get("Content-Type", "")).lower()
     if "charset=" in ctype:
-        return resp.text
+        charset = ctype.split("charset=", 1)[1].split(";", 1)[0].strip(" \"'")
+        try:
+            return resp.content.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            pass
     try:
         return resp.content.decode("utf-8")
     except UnicodeDecodeError:

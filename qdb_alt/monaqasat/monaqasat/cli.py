@@ -1055,6 +1055,22 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_pack(args) -> int:
+    """Write a copy with no stored HTML, small enough to put in git."""
+    from .store import pack_database
+    src = Path(args.db)
+    if not src.exists():
+        print(f"no database at {src}", file=sys.stderr)
+        return 1
+    before = src.stat().st_size
+    size = pack_database(str(src), args.out)
+    print(f"packed {before/1e6:.0f} MB -> {size/1e6:.1f} MB")
+    print(f"wrote {args.out}")
+    print("HTML is not in this file. On the other laptop, copy it to")
+    print("monaqasat.db and keep harvesting; crawl progress is included.")
+    return 0
+
+
 def cmd_export(args) -> int:
     store = Store(args.db)
     sql = {
@@ -1393,6 +1409,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stats", help="what is in the store")
     db(sp)
     sp.set_defaults(func=cmd_stats)
+
+    sp = sub.add_parser(
+        "pack",
+        help="copy the database without HTML so it can go in git",
+    )
+    db(sp)
+    sp.add_argument("--out", default="data/monaqasat.slim.db")
+    sp.set_defaults(func=cmd_pack)
 
     sp = sub.add_parser("export", help="dump a table to CSV")
     db(sp)
