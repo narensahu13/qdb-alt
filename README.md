@@ -9,9 +9,13 @@ python -m monaqasat harvest --max-hours 6
 ```
 
 A first load takes more than one sitting. `harvest` stops cleanly at the time
-limit and the next run continues. After backfill, the same command only
-stores new tenders and updates ones that changed state (for example open last
-month, awarded this month).
+limit and the next run continues. After backfill, the same command keeps the
+store current: new tenders, and every tender that moved section (open last
+month, closed this week, awarded today) wherever it lands in the list.
+
+What changed on 22 Sept 2026 and why -- matching, CR numbers, section
+updates, features -- is in
+[`qdb_alt/monaqasat/FIXES.md`](qdb_alt/monaqasat/FIXES.md).
 
 To keep extracting overnight without leaving the laptop lid-open in front of
 you: `scripts\install-task.ps1` registers a nightly Windows task. Set lid-close
