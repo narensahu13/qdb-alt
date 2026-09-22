@@ -17,7 +17,7 @@ $log = Join-Path $logDir ("harvest-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 
 function Write-Log([string]$msg) {
     $line = "{0}  {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
-    Add-Content -Path $log -Value $line
+    [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
     Write-Host $line
 }
 
@@ -29,8 +29,31 @@ if (-not $py) {
     exit 1
 }
 
-& python -m monaqasat harvest --db $Db --max-hours $MaxHours *>> $log
-$code = $LASTEXITCODE
-& python -m monaqasat status --db $Db *>> $log
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+function Invoke-LoggedPython([string]$arguments) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $py.Source
+    $psi.Arguments = $arguments
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    while (-not $proc.StandardOutput.EndOfStream) {
+        $line = $proc.StandardOutput.ReadLine()
+        if ($null -ne $line) { Write-Log $line }
+    }
+    $err = $proc.StandardError.ReadToEnd()
+    if ($err) { Write-Log $err.TrimEnd() }
+    $proc.WaitForExit()
+    return $proc.ExitCode
+}
+
+$code = Invoke-LoggedPython "-m monaqasat harvest --db $Db --max-hours $MaxHours"
+Invoke-LoggedPython "-m monaqasat status --db $Db" | Out-Null
 Write-Log "harvest exit $code"
 exit $code
