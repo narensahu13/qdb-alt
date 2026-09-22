@@ -7,20 +7,32 @@ Raw HTML is kept deliberately. Parsers get things wrong and sites change; if
 the pages are on disk you re-parse in seconds instead of re-crawling 1,200
 pages and annoying a government web server. It also means the fetch date of
 every field is provable, which is what makes this usable as evidence.
+
+How a tender's state is kept (see FIXES.md, "state model"):
+
+  sighting   one row per (tender, section) it has ever been listed in, with
+             first_seen / last_seen, and gone_at once a full read of that
+             section no longer lists it (two reads in a row, so a page that
+             shifted mid-read cannot fake a departure).
+  state      the most advanced section the tender is *currently* listed in.
+             Nothing is ever deleted: a tender that moved from Available to
+             Closed keeps its Available sighting, marked gone.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from .fingerprint import canonical_html_sha256
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_page (
     url         TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,          -- listing | detail
+    kind        TEXT NOT NULL,          -- listing | detail | tender_details | classified
     tender_id   TEXT,
     page        INTEGER,
     status      INTEGER,
@@ -89,7 +101,10 @@ CREATE TABLE IF NOT EXISTS classified_company (
     classification  TEXT,
     certificate_end TEXT,               -- classification expiry
     page            INTEGER,
-    parsed_at       TEXT
+    parsed_at       TEXT,
+    last_pass       INTEGER,            -- register pass it was last seen in
+    missed          INTEGER NOT NULL DEFAULT 0,
+    delisted_at     TEXT                -- set after two full passes without it
 );
 
 CREATE TABLE IF NOT EXISTS company_activity (
@@ -113,7 +128,9 @@ CREATE TABLE IF NOT EXISTS company (
     financial_result  TEXT,
     local_value_ratio TEXT,
     notes             TEXT,
-    stage             TEXT,              -- awarded | technical | financial | technical_financial
+    stage             TEXT,              -- the page table the row came from:
+                                         -- awarded | technical | financial |
+                                         -- technical_financial | unknown
     PRIMARY KEY (tender_id, role, seq)
 );
 
@@ -130,7 +147,7 @@ CREATE TABLE IF NOT EXISTS match (
     tender_id     TEXT NOT NULL,
     role          TEXT NOT NULL,
     seq           INTEGER NOT NULL,
-    method        TEXT NOT NULL,        -- cr | name_exact | name_fuzzy
+    method        TEXT NOT NULL,        -- cr | name_exact | name_fuzzy | name_translit
     score         REAL,
     customer_name TEXT,
     matched_name  TEXT,
@@ -139,10 +156,11 @@ CREATE TABLE IF NOT EXISTS match (
     PRIMARY KEY (customer_id, tender_id, role, seq)
 );
 
--- Every time a tender is seen in a section. Page numbers shift as new
+-- Every section a tender has been listed in. Page numbers shift as new
 -- tenders are published, so incremental crawling is keyed on tender id and
 -- section, never on page number. This table is also the lifecycle record:
--- when a tender went from technical to financial to awarded.
+-- when a tender went from technical to financial to awarded, and when it
+-- stopped being listed in each.
 CREATE TABLE IF NOT EXISTS sighting (
     tender_id  TEXT NOT NULL,
     kind       TEXT NOT NULL,
@@ -150,6 +168,9 @@ CREATE TABLE IF NOT EXISTS sighting (
     state      TEXT,
     first_seen TEXT NOT NULL,
     last_seen  TEXT NOT NULL,
+    last_run   INTEGER,                -- run that last listed it here
+    missed     INTEGER NOT NULL DEFAULT 0,  -- full reads in a row without it
+    gone_at    TEXT,                   -- no longer listed in this section
     PRIMARY KEY (tender_id, kind)
 );
 
@@ -166,10 +187,14 @@ CREATE TABLE IF NOT EXISTS detail_fetch (
 );
 
 -- Pages that failed. Skipped so one slow page cannot sink a long run, and
--- retried automatically on the next one.
+-- retried automatically later. kind is a section for listing pages,
+-- 'companies' / 'tender_details' for detail pages (ref "id@state" for
+-- companies), and 'missing:<page type>' for pages the site answers with its
+-- home page -- those are not network failures and are retried weekly, three
+-- times, without tripping the consecutive-failure stop.
 CREATE TABLE IF NOT EXISTS failed_page (
     kind      TEXT NOT NULL,
-    ref       TEXT NOT NULL,           -- page number, or tender id
+    ref       TEXT NOT NULL,
     url       TEXT,
     error     TEXT,
     attempts  INTEGER NOT NULL DEFAULT 1,
@@ -177,15 +202,17 @@ CREATE TABLE IF NOT EXISTS failed_page (
     PRIMARY KEY (kind, ref)
 );
 
--- Per-section progress, so an interrupted first load is finished by later
--- update runs rather than silently abandoned.
+-- Per-section progress.
 CREATE TABLE IF NOT EXISTS section_state (
     kind              TEXT PRIMARY KEY,
     reached_end       INTEGER NOT NULL DEFAULT 0,   -- read to the last page
     backfill_complete INTEGER NOT NULL DEFAULT 0,   -- ... and no holes left
     deepest_page      INTEGER NOT NULL DEFAULT 0,
     last_page_seen    INTEGER,
-    last_update       TEXT
+    last_update       TEXT,
+    last_full_pass    TEXT,              -- last time every page was read
+    roll_next         INTEGER,           -- next page of a rolling pass
+    pass_id           INTEGER NOT NULL DEFAULT 0   -- register passes
 );
 
 CREATE TABLE IF NOT EXISTS run (
@@ -214,9 +241,10 @@ CREATE TABLE IF NOT EXISTS feature_cr_month (
     awards_life_value      REAL,
     largest_award_12m      REAL,
     months_since_last_award INTEGER,
-    bids_12m_count         INTEGER,
+    bids_12m_count         INTEGER,         -- tenders it appeared in
+    decided_12m_count      INTEGER,         -- ... whose winners are known
     wins_12m_count         INTEGER,
-    win_rate_12m           REAL,
+    win_rate_12m           REAL,            -- wins / decided, >= 3 decided
     distinct_buyers_12m    INTEGER,
     top_buyer_share_12m    REAL,
     months_since_first_seen INTEGER,
@@ -236,21 +264,40 @@ CREATE INDEX IF NOT EXISTS ix_cc_cr        ON classified_company(cr_root);
 CREATE INDEX IF NOT EXISTS ix_cc_name      ON classified_company(name_normalised);
 """
 
+# Indexes on columns that older databases only get from _migrate().
+LATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS ix_sighting_kind ON sighting(kind, gone_at);
+"""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# How far along its life a tender is. A tender listed under several sections
-# over time keeps the most advanced one. Cancelled is terminal.
+# How far along its life a tender is. Cancelled is terminal.
 STATE_RANK = {
     None: -1, "future": 0, "published": 1, "closed": 2, "technical": 3,
     "financial": 4, "awarded": 5, "cancelled": 6,
 }
+# States a tender can genuinely return to: a closing date extended after
+# closing puts a tender back in Available. Once opened, it never goes back.
+PRE_OPENING = {"future", "published", "closed"}
+COMPANY_STATES = ("technical", "financial", "awarded")
+
+GONE_AFTER = 2              # full reads in a row without a tender
+DETAIL_MAX_ATTEMPTS = 5     # network failures before a page is left alone
+MISSING_MAX_ATTEMPTS = 3    # home-page answers before a page is left alone
+MISSING_RETRY_DAYS = 7
 
 
 def state_rank(state: str | None) -> int:
     return STATE_RANK.get(state, -1)
+
+
+def companies_ref(tender_id: str, state: str | None) -> str:
+    """Failure key for a companies page: per tender *and* state, so a page
+    that kept failing before the award gets a fresh start after it."""
+    return f"{tender_id}@{state or ''}"
 
 
 class Store:
@@ -265,45 +312,65 @@ class Store:
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._migrate()
+        self.conn.executescript(LATE_INDEXES)
+        self.conn.commit()
+
+    # -- migration --------------------------------------------------------
+    def _cols(self, table: str) -> set[str]:
+        return {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _add(self, table: str, column: str, decl: str) -> bool:
+        if column in self._cols(table):
+            return False
+        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        return True
 
     def _migrate(self) -> None:
-        """Bring a database from an earlier version up to date, once.
+        """Bring a database from any earlier version up to date.
 
-        Older stores kept no sightings or fetch log. Rebuild both from what
-        is already on disk so the first incremental run does not refetch
-        pages we hold.
+        Every step checks before it acts, so running it on a current
+        database does nothing.
         """
         c = self.conn
-        cols = {r[1] for r in c.execute("PRAGMA table_info(section_state)")}
-        if "reached_end" not in cols:
-            c.execute("ALTER TABLE section_state ADD COLUMN reached_end"
-                      " INTEGER NOT NULL DEFAULT 0")
+        if self._add("section_state", "reached_end",
+                     "INTEGER NOT NULL DEFAULT 0"):
             c.execute("UPDATE section_state SET reached_end=backfill_complete")
+        self._add("section_state", "last_full_pass", "TEXT")
+        self._add("section_state", "roll_next", "INTEGER")
+        self._add("section_state", "pass_id", "INTEGER NOT NULL DEFAULT 0")
 
-        raw_cols = {r[1] for r in c.execute("PRAGMA table_info(raw_page)")}
-        if "content_sha256" not in raw_cols:
-            c.execute("ALTER TABLE raw_page ADD COLUMN content_sha256 TEXT")
-        if "first_seen_at" not in raw_cols:
-            c.execute("ALTER TABLE raw_page ADD COLUMN first_seen_at TEXT")
+        if self._add("raw_page", "first_seen_at", "TEXT"):
             c.execute("UPDATE raw_page SET first_seen_at=fetched_at"
                       " WHERE first_seen_at IS NULL")
+        self._add("raw_page", "content_sha256", "TEXT")
+        self._add("tender", "financial_open_date", "TEXT")
+        self._add("company", "stage", "TEXT")
 
-        tender_cols = {r[1] for r in c.execute("PRAGMA table_info(tender)")}
-        if "financial_open_date" not in tender_cols:
-            c.execute("ALTER TABLE tender ADD COLUMN financial_open_date TEXT")
+        self._add("sighting", "last_run", "INTEGER")
+        self._add("sighting", "missed", "INTEGER NOT NULL DEFAULT 0")
+        self._add("sighting", "gone_at", "TEXT")
 
-        company_cols = {r[1] for r in c.execute("PRAGMA table_info(company)")}
-        if "stage" not in company_cols:
-            c.execute("ALTER TABLE company ADD COLUMN stage TEXT")
-            c.execute("UPDATE company SET stage=role WHERE stage IS NULL")
+        self._add("classified_company", "last_pass", "INTEGER")
+        self._add("classified_company", "missed", "INTEGER NOT NULL DEFAULT 0")
+        self._add("classified_company", "delisted_at", "TEXT")
 
+        self._add("feature_cr_month", "decided_12m_count", "INTEGER")
+
+        # Sightings and the fetch log, rebuilt from what is on disk for
+        # databases that predate them, so the first run does not refetch.
         if c.execute("SELECT COUNT(*) FROM sighting").fetchone()[0] == 0:
-            c.execute(
-                "INSERT OR IGNORE INTO sighting"
-                " (tender_id, kind, family, state, first_seen, last_seen)"
-                " SELECT tender_id, COALESCE(state, 'unknown'), family, state,"
-                "        COALESCE(parsed_at, ?), COALESCE(parsed_at, ?)"
-                " FROM tender WHERE state IS NOT NULL", (_now(), _now()))
+            now = _now()
+            for row in c.execute("SELECT tender_id, family, state, parsed_at"
+                                 " FROM tender WHERE state IS NOT NULL"
+                                 ).fetchall():
+                kind = _kind_for(row["family"], row["state"])
+                if kind:
+                    c.execute(
+                        "INSERT OR IGNORE INTO sighting (tender_id, kind,"
+                        " family, state, first_seen, last_seen)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (row["tender_id"], kind, row["family"], row["state"],
+                         row["parsed_at"] or now, row["parsed_at"] or now))
         if c.execute("SELECT COUNT(*) FROM detail_fetch").fetchone()[0] == 0:
             c.execute(
                 "INSERT OR IGNORE INTO detail_fetch"
@@ -315,7 +382,61 @@ class Store:
                 " FROM raw_page r LEFT JOIN tender t USING (tender_id)"
                 " WHERE r.kind IN ('detail', 'tender_details')"
                 "   AND r.tender_id IS NOT NULL")
+
+        version = c.execute("PRAGMA user_version").fetchone()[0]
+        if version < 2:
+            self._migrate_to_2()
         c.commit()
+
+    def _migrate_to_2(self) -> None:
+        """Repairs for databases written before the Sept 2026 fixes."""
+        from .normalize import cr_root, normalize_name
+        from .parse import LISTING_KINDS
+        c = self.conn
+
+        # 1. CR roots and names were normalised by functions that turned
+        #    "29,309" into "29" and Arabic names into "". Recompute them.
+        for table, key in (("company", ("tender_id", "role", "seq")),
+                           ("classified_company", ("profile_number",))):
+            rows = c.execute(
+                f"SELECT {', '.join(key)}, name, cr_number FROM {table}"
+            ).fetchall()
+            c.executemany(
+                f"UPDATE {table} SET cr_root=?, name_normalised=?"
+                f" WHERE {' AND '.join(f'{k}=?' for k in key)}",
+                [(cr_root(r["cr_number"]), normalize_name(r["name"]),
+                  *(r[k] for k in key)) for r in rows])
+
+        # 2. The first stage migration copied role into stage, leaving the
+        #    value 'bidder' (and databases from before it have no stage at
+        #    all). For bidders the table it came from is not known; `parse`
+        #    recovers it from the stored HTML.
+        c.execute("UPDATE company SET stage = CASE role WHEN 'awarded'"
+                  " THEN 'awarded' ELSE 'unknown' END"
+                  " WHERE stage IS NULL OR stage='bidder'")
+
+        # 3. Sightings backfilled from state names ('published', or a bid
+        #    'awarded') used kinds that do not exist. Re-key them.
+        for row in c.execute("SELECT rowid, * FROM sighting").fetchall():
+            if row["kind"] in LISTING_KINDS and (
+                    LISTING_KINDS[row["kind"]]["family"] == row["family"]
+                    or row["family"] is None):
+                continue
+            kind = _kind_for(row["family"], row["state"])
+            if kind and kind != row["kind"]:
+                c.execute("INSERT OR IGNORE INTO sighting (tender_id, kind,"
+                          " family, state, first_seen, last_seen)"
+                          " VALUES (?,?,?,?,?,?)",
+                          (row["tender_id"], kind, row["family"],
+                           row["state"], row["first_seen"], row["last_seen"]))
+                c.execute("DELETE FROM sighting WHERE rowid=?", (row["rowid"],))
+
+        # 4. Detail failures were keyed per section ("awarded:companies").
+        #    Detail fetching is now one queue; drop the old keys and let
+        #    those pages be tried again under the new ones.
+        c.execute("DELETE FROM failed_page WHERE kind LIKE '%:%'"
+                  " AND kind NOT LIKE 'missing:%'")
+        c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
         self.conn.close()
@@ -367,16 +488,16 @@ class Store:
             "SELECT * FROM raw_page WHERE kind=? ORDER BY page, tender_id",
             (kind,))
 
-    def missing_detail_ids(self) -> list[str]:
-        """Tender ids seen in listings whose detail page is not yet stored."""
-        cur = self.conn.execute(
-            "SELECT DISTINCT t.tender_id FROM tender t"
-            " LEFT JOIN raw_page r ON r.kind='detail' AND r.tender_id=t.tender_id"
-            " WHERE r.url IS NULL")
-        return [r[0] for r in cur.fetchall()]
-
     # -- parsed ---------------------------------------------------------
     def upsert_tender(self, row: dict[str, Any], source_url: str = "") -> None:
+        """Insert or update a tender's fields.
+
+        Never overwrites a populated column with NULL: the listing carries
+        less than the detail page and may be parsed afterwards. A state given
+        here only ever moves forward; the crawl itself does not pass one --
+        it records sightings and calls refresh_state(), which can also move a
+        re-opened tender back to Available.
+        """
         row = dict(row)
         row["source_url"] = source_url
         row["parsed_at"] = _now()
@@ -393,12 +514,9 @@ class Store:
             "contract_duration", "warranty_period", "maintenance_period",
             "disbursement_method",
             "source_url", "parsed_at") if c in row]
-        # Never overwrite a populated column with NULL: the listing carries
-        # less than the detail page and may be parsed afterwards. And never
-        # move a tender backwards: crawling "technical" after "awarded" must
-        # not demote an awarded tender.
         rank_case = " ".join(f"WHEN '{k}' THEN {v}"
                              for k, v in STATE_RANK.items() if k)
+
         def _set(c):
             if c == "state":
                 return (f"state=CASE WHEN (CASE excluded.state {rank_case}"
@@ -418,7 +536,14 @@ class Store:
 
     def replace_companies(self, tender_id: str,
                           rows: list[dict[str, Any]]) -> None:
-        from .normalize import cr_root
+        """Replace a tender's company rows with those from its latest page.
+
+        Safe because the page only ever gains information as a tender
+        advances (checked on the live site, Sept 2026): at financial opening
+        it lists bidder names only; after the award it lists the winners,
+        every bidder, and the prices.
+        """
+        from .normalize import cr_root, normalize_name
         self.conn.execute("DELETE FROM company WHERE tender_id=?", (tender_id,))
         for r in rows:
             self.conn.execute(
@@ -427,11 +552,13 @@ class Store:
                 " financial_result, local_value_ratio, notes, stage)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (tender_id, r["role"], r["seq"], r.get("name"),
-                 r.get("name_normalised"), r.get("cr_number"),
+                 r.get("name_normalised") or normalize_name(r.get("name")),
+                 r.get("cr_number"),
                  cr_root(r.get("cr_number")), r.get("cr_secondary"),
                  r.get("value"), r.get("financial_result"),
                  r.get("local_value_ratio"), r.get("notes"),
-                 r.get("stage") or r["role"]),
+                 r.get("stage") or ("awarded" if r["role"] == "awarded"
+                                    else "unknown")),
             )
 
     def replace_tender_activities(self, tender_id: str,
@@ -444,18 +571,42 @@ class Store:
                 " (tender_id, activity_code, activity_name) VALUES (?,?,?)",
                 (tender_id, r["activity_code"], r.get("activity_name")))
 
-    def upsert_company(self, row: dict[str, Any], page: int | None = None) -> None:
-        from .normalize import cr_root
+    def upsert_company(self, row: dict[str, Any], page: int | None = None,
+                       pass_id: int | None = None) -> None:
+        """A classified-register row.
+
+        With a pass_id the company was just seen on the live register, which
+        resets any delisting. Without one (re-parsing stored HTML) the
+        delisting bookkeeping is left exactly as it was.
+        """
+        from .normalize import cr_root, normalize_name
         self.conn.execute(
-            "INSERT OR REPLACE INTO classified_company (profile_number,"
+            "INSERT INTO classified_company (profile_number,"
             " company_type, name, name_normalised, cr_number, cr_root,"
             " cr_secondary, size, evaluation, classification, certificate_end,"
-            " page, parsed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " page, parsed_at, last_pass, missed, delisted_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL)"
+            " ON CONFLICT(profile_number) DO UPDATE SET"
+            " company_type=excluded.company_type, name=excluded.name,"
+            " name_normalised=excluded.name_normalised,"
+            " cr_number=excluded.cr_number, cr_root=excluded.cr_root,"
+            " cr_secondary=excluded.cr_secondary, size=excluded.size,"
+            " evaluation=excluded.evaluation,"
+            " classification=excluded.classification,"
+            " certificate_end=excluded.certificate_end, page=excluded.page,"
+            " parsed_at=excluded.parsed_at,"
+            " last_pass=COALESCE(excluded.last_pass,"
+            "                    classified_company.last_pass),"
+            " missed=CASE WHEN excluded.last_pass IS NULL"
+            "        THEN classified_company.missed ELSE 0 END,"
+            " delisted_at=CASE WHEN excluded.last_pass IS NULL"
+            "        THEN classified_company.delisted_at ELSE NULL END",
             (row["profile_number"], row.get("company_type"), row.get("name"),
-             row.get("name_normalised"), row.get("cr_number"),
+             row.get("name_normalised") or normalize_name(row.get("name")),
+             row.get("cr_number"),
              cr_root(row.get("cr_number")), row.get("cr_secondary"),
              row.get("size"), row.get("evaluation"), row.get("classification"),
-             row.get("certificate_end"), page, _now()))
+             row.get("certificate_end"), page, _now(), pass_id))
         self.conn.execute("DELETE FROM company_activity WHERE profile_number=?",
                           (row["profile_number"],))
         for a in row.get("activities", []):
@@ -465,47 +616,130 @@ class Store:
                 (row["profile_number"], a["activity_code"],
                  a.get("activity_name"), a.get("grade")))
 
-    # -- incremental bookkeeping ----------------------------------------
-    def record_sighting(self, tender_id: str, kind: str, family: str | None,
-                        state: str | None) -> tuple[bool, bool]:
-        """Note that a tender was listed under a section.
+    def mark_unlisted(self, pass_id: int) -> tuple[int, int]:
+        """After a complete register pass: count a miss for every company
+        the pass did not see, and mark it delisted after GONE_AFTER passes.
+        Returns (missed now, newly delisted)."""
+        cur = self.conn.execute(
+            "UPDATE classified_company SET missed = missed + 1"
+            " WHERE delisted_at IS NULL"
+            "   AND (last_pass IS NULL OR last_pass != ?)", (pass_id,))
+        missed = cur.rowcount
+        cur = self.conn.execute(
+            "UPDATE classified_company SET delisted_at=?"
+            " WHERE delisted_at IS NULL AND missed >= ?", (_now(), GONE_AFTER))
+        self.conn.commit()
+        return missed, cur.rowcount
 
-        Returns (new_in_section, state_advanced). new_in_section is what
-        drives the "caught up" test; state_advanced is what triggers a
-        refetch of the companies page.
+    # -- lifecycle ------------------------------------------------------
+    def record_sighting(self, tender_id: str, kind: str, family: str | None,
+                        state: str | None, run_id: int | None = None) -> bool:
+        """Note that a tender is listed under a section right now.
+
+        Returns True the first time it is seen in that section -- what drives
+        the "caught up" test. Seeing it again clears any gone marker: it is
+        back on the list.
         """
         now = _now()
-        prev = self.conn.execute(
-            "SELECT state FROM tender WHERE tender_id=?", (tender_id,)
-        ).fetchone()
-        seen = self.conn.execute(
-            "SELECT 1 FROM sighting WHERE tender_id=? AND kind=?",
-            (tender_id, kind)).fetchone()
-        if seen:
-            self.conn.execute(
-                "UPDATE sighting SET last_seen=? WHERE tender_id=? AND kind=?",
-                (now, tender_id, kind))
-        else:
-            self.conn.execute(
-                "INSERT INTO sighting (tender_id, kind, family, state,"
-                " first_seen, last_seen) VALUES (?,?,?,?,?,?)",
-                (tender_id, kind, family, state, now, now))
-        advanced = (prev is not None
-                    and state_rank(state) > state_rank(prev["state"]))
-        return (seen is None, advanced)
+        cur = self.conn.execute(
+            "UPDATE sighting SET last_seen=?, last_run=?, missed=0,"
+            " gone_at=NULL WHERE tender_id=? AND kind=?",
+            (now, run_id, tender_id, kind))
+        if cur.rowcount:
+            return False
+        self.conn.execute(
+            "INSERT INTO sighting (tender_id, kind, family, state, first_seen,"
+            " last_seen, last_run) VALUES (?,?,?,?,?,?,?)",
+            (tender_id, kind, family, state, now, now, run_id))
+        return True
 
-    def needs_detail(self, tender_id: str, page_type: str,
-                     state: str | None) -> bool:
-        """Fetch if we never have, or if the tender has moved on since."""
-        row = self.conn.execute(
-            "SELECT state FROM detail_fetch WHERE tender_id=? AND page_type=?",
-            (tender_id, page_type)).fetchone()
+    def refresh_state(self, tender_id: str) -> tuple[str | None, str] | None:
+        """Set a tender's state from the sections it is listed in now.
+
+        The most advanced current listing wins, because the site lists a
+        tender in several sections at once (every Financially Opened tender
+        is also under Technically Opened). A state only moves backwards
+        before opening -- a closing date extended after closing sends a
+        tender back to Available. A tender listed nowhere keeps its last
+        known state. Returns (old, new) when it changed.
+        """
+        row = self.conn.execute("SELECT state FROM tender WHERE tender_id=?",
+                                (tender_id,)).fetchone()
         if row is None:
-            return True
-        if page_type == "companies":
-            return state_rank(state) > state_rank(row["state"])
-        return False            # the description does not change with state
+            return None
+        old = row["state"]
+        listed = [r["state"] for r in self.conn.execute(
+            "SELECT state FROM sighting WHERE tender_id=? AND gone_at IS NULL",
+            (tender_id,))]
+        if not listed:
+            return None
+        best = max(listed, key=state_rank)
+        if state_rank(best) > state_rank(old):
+            new = best
+        elif state_rank(best) < state_rank(old) and old in PRE_OPENING:
+            new = best
+        else:
+            return None
+        if new == old:
+            return None
+        self.conn.execute("UPDATE tender SET state=? WHERE tender_id=?",
+                          (new, tender_id))
+        return old, new
 
+    def mark_unseen(self, kind: str, run_id: int) -> list[str]:
+        """After a complete, clean read of a section: count a miss for every
+        tender listed there before but not in this read; after GONE_AFTER
+        misses in a row, mark it gone and re-derive its state.
+
+        Two misses, not one: a tender that leaves a list while it is being
+        read shifts the rest up a place, and the one that crosses the page
+        boundary is skipped for that read. Returns tenders newly gone.
+        """
+        self.conn.execute(
+            "UPDATE sighting SET missed = missed + 1"
+            " WHERE kind=? AND gone_at IS NULL"
+            "   AND (last_run IS NULL OR last_run != ?)", (kind, run_id))
+        gone = [r[0] for r in self.conn.execute(
+            "SELECT tender_id FROM sighting WHERE kind=? AND gone_at IS NULL"
+            " AND missed >= ?", (kind, GONE_AFTER))]
+        self.conn.execute(
+            "UPDATE sighting SET gone_at=? WHERE kind=? AND gone_at IS NULL"
+            " AND missed >= ?", (_now(), kind, GONE_AFTER))
+        for tid in gone:
+            self.refresh_state(tid)
+        self.conn.commit()
+        return gone
+
+    def current_state(self, tender_id: str) -> str | None:
+        row = self.conn.execute("SELECT state FROM tender WHERE tender_id=?",
+                                (tender_id,)).fetchone()
+        return row["state"] if row else None
+
+    def watermark(self, kind: str, field: str = "awarded_date") -> str | None:
+        """Latest date among tenders already listed in a section, capped at
+        today (a mistyped future date must not move the stopping point)."""
+        today = date.today().isoformat()
+        row = self.conn.execute(
+            f"SELECT MAX(t.{field}) FROM tender t JOIN sighting s"
+            f" ON s.tender_id=t.tender_id AND s.kind=?"
+            f" WHERE t.{field} IS NOT NULL AND t.{field} <= ?",
+            (kind, today)).fetchone()
+        return row[0] if row else None
+
+    def left_every_list(self) -> list[str]:
+        """Tenders no longer listed anywhere we have read, and not yet seen
+        in a final state. Usually a tender whose next section has not been
+        reached yet (a rolling pass of Awarded or Cancelled finds it)."""
+        sql = ("SELECT t.tender_id FROM tender t"
+               " WHERE t.state NOT IN ('awarded', 'cancelled')"
+               "   AND EXISTS (SELECT 1 FROM sighting s"
+               "               WHERE s.tender_id=t.tender_id)"
+               "   AND NOT EXISTS (SELECT 1 FROM sighting s"
+               "                   WHERE s.tender_id=t.tender_id"
+               "                     AND s.gone_at IS NULL)")
+        return [r[0] for r in self.conn.execute(sql)]
+
+    # -- details --------------------------------------------------------
     def mark_detail(self, tender_id: str, page_type: str,
                     state: str | None) -> None:
         self.conn.execute(
@@ -513,40 +747,70 @@ class Store:
             " (tender_id, page_type, state, fetched_at) VALUES (?,?,?,?)",
             (tender_id, page_type, state, _now()))
 
-    def current_state(self, tender_id: str) -> str | None:
-        row = self.conn.execute("SELECT state FROM tender WHERE tender_id=?",
-                                (tender_id,)).fetchone()
-        return row["state"] if row else None
+    def detail_jobs(self, kinds: Iterable[str], *, tender_details: bool = True
+                    ) -> list[tuple[str, str, str | None]]:
+        """Detail pages to fetch, most valuable first: (page_type, id, state).
 
-    def pending_details(self, kind: str, page_type: str,
-                        max_attempts: int = 5) -> list[tuple[str, str | None]]:
-        """Tenders sighted in a section whose detail page is missing or stale.
+          1. companies pages of awarded tenders not yet read since the award
+             -- winners, every bidder, and prices
+          2. companies pages of tenders in technical / financial opening,
+             never read -- who is bidding now
+          3. TenderDetails pages never read
 
-        Driven by what is stored, not by which pages this run happened to
-        walk -- so a detail phase interrupted last week is finished this
-        week without re-reading a single listing page. Pages that have
-        failed max_attempts times are left alone and reported instead.
+        A companies page is read again only when the tender reaches
+        'awarded': at financial opening the page still shows the technical
+        list only (live site, Sept 2026), so re-reading it then adds nothing.
+        Driven by what is stored, not by which pages this run walked, so an
+        interrupted detail phase is finished next time without re-reading a
+        single listing page.
         """
-        rows = self.conn.execute(
-            "SELECT s.tender_id, t.state AS now_state, d.state AS got_state,"
-            "       d.tender_id AS have"
-            " FROM sighting s JOIN tender t USING (tender_id)"
-            " LEFT JOIN detail_fetch d"
-            "   ON d.tender_id = s.tender_id AND d.page_type = ?"
-            " WHERE s.kind = ?", (page_type, kind)).fetchall()
-        dead = {r["ref"] for r in self.conn.execute(
-            "SELECT ref FROM failed_page WHERE kind=? AND attempts>=?",
-            (f"{kind}:{page_type}", max_attempts))}
-        out = []
-        for r in rows:
-            if r["tender_id"] in dead:
-                continue
-            if r["have"] is None:
-                out.append((r["tender_id"], r["now_state"]))
-            elif (page_type == "companies"
-                  and state_rank(r["now_state"]) > state_rank(r["got_state"])):
-                out.append((r["tender_id"], r["now_state"]))
-        return out
+        kinds = list(kinds)
+        if not kinds:
+            return []
+        marks = ",".join("?" * len(kinds))
+        sighted = (f"EXISTS (SELECT 1 FROM sighting s WHERE s.tender_id ="
+                   f" t.tender_id AND s.kind IN ({marks}))")
+        dead = {(r["kind"], r["ref"]) for r in self.conn.execute(
+            "SELECT kind, ref FROM failed_page WHERE"
+            " (kind IN ('companies', 'tender_details') AND attempts >= ?)"
+            " OR (kind LIKE 'missing:%' AND (attempts >= ? OR failed_at > ?))",
+            (DETAIL_MAX_ATTEMPTS, MISSING_MAX_ATTEMPTS,
+             (datetime.now(timezone.utc)
+              - timedelta(days=MISSING_RETRY_DAYS)).isoformat(
+                  timespec="seconds")))}
+
+        def alive(ptype, tid, state):
+            if (f"missing:{ptype}", tid) in dead:
+                return False
+            ref = companies_ref(tid, state) if ptype == "companies" else tid
+            return (ptype, ref) not in dead
+
+        comp = self.conn.execute(
+            f"SELECT t.tender_id, t.state FROM tender t"
+            f" LEFT JOIN detail_fetch d ON d.tender_id = t.tender_id"
+            f"   AND d.page_type = 'companies'"
+            f" WHERE {sighted} AND t.state IN ('technical','financial','awarded')"
+            f"   AND (d.tender_id IS NULL"
+            f"        OR (t.state = 'awarded' AND COALESCE(d.state, '')"
+            f"            != 'awarded'))"
+            f" ORDER BY CASE t.state WHEN 'awarded' THEN 0 ELSE 1 END,"
+            f"          COALESCE(t.awarded_date, '') DESC,"
+            f"          CAST(t.tender_id AS INTEGER) DESC",
+            kinds).fetchall()
+        jobs = [("companies", r["tender_id"], r["state"]) for r in comp
+                if alive("companies", r["tender_id"], r["state"])]
+        if tender_details:
+            det = self.conn.execute(
+                f"SELECT t.tender_id, t.state FROM tender t"
+                f" LEFT JOIN detail_fetch d ON d.tender_id = t.tender_id"
+                f"   AND d.page_type = 'tender_details'"
+                f" WHERE {sighted} AND d.tender_id IS NULL"
+                f" ORDER BY CAST(t.tender_id AS INTEGER) DESC",
+                kinds).fetchall()
+            jobs += [("tender_details", r["tender_id"], r["state"])
+                     for r in det
+                     if alive("tender_details", r["tender_id"], r["state"])]
+        return jobs
 
     def record_failure(self, kind: str, ref: str, url: str,
                        error: str) -> None:
@@ -558,9 +822,20 @@ class Store:
             (kind, str(ref), url, error[:300], _now()))
         self.conn.commit()
 
+    def record_missing(self, page_type: str, tender_id: str, url: str) -> None:
+        """The site answered with its home page: not a network failure."""
+        self.record_failure(f"missing:{page_type}", tender_id, url,
+                            "the site returned its home page for this id")
+
     def clear_failure(self, kind: str, ref: str) -> None:
         self.conn.execute("DELETE FROM failed_page WHERE kind=? AND ref=?",
                           (kind, str(ref)))
+
+    def clear_failures_beyond(self, kind: str, last: int) -> None:
+        """Listing failures on pages past the end: the section shrank."""
+        for r in self.failures(kind):
+            if str(r["ref"]).isdigit() and int(r["ref"]) > last:
+                self.clear_failure(kind, r["ref"])
 
     def failures(self, kind: str | None = None) -> list[sqlite3.Row]:
         if kind:
@@ -626,28 +901,21 @@ class Store:
         return {r[0] for r in cur.fetchall()}
 
     def replace_features(self, rows: list[dict[str, Any]]) -> int:
+        cols = ["cr_root", "as_of_month", "awards_12m_count",
+                "awards_12m_value", "awards_36m_count", "awards_36m_value",
+                "awards_life_value", "largest_award_12m",
+                "months_since_last_award", "bids_12m_count",
+                "decided_12m_count", "wins_12m_count", "win_rate_12m",
+                "distinct_buyers_12m", "top_buyer_share_12m",
+                "months_since_first_seen", "classified_size",
+                "classified_evaluation", "certificate_end", "feature_version",
+                "built_at"]
         self.conn.execute("DELETE FROM feature_cr_month")
-        for r in rows:
-            self.conn.execute(
-                "INSERT INTO feature_cr_month (cr_root, as_of_month,"
-                " awards_12m_count, awards_12m_value, awards_36m_count,"
-                " awards_36m_value, awards_life_value, largest_award_12m,"
-                " months_since_last_award, bids_12m_count, wins_12m_count,"
-                " win_rate_12m, distinct_buyers_12m, top_buyer_share_12m,"
-                " months_since_first_seen, classified_size,"
-                " classified_evaluation, certificate_end, feature_version,"
-                " built_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (r["cr_root"], r["as_of_month"], r.get("awards_12m_count"),
-                 r.get("awards_12m_value"), r.get("awards_36m_count"),
-                 r.get("awards_36m_value"), r.get("awards_life_value"),
-                 r.get("largest_award_12m"), r.get("months_since_last_award"),
-                 r.get("bids_12m_count"), r.get("wins_12m_count"),
-                 r.get("win_rate_12m"), r.get("distinct_buyers_12m"),
-                 r.get("top_buyer_share_12m"), r.get("months_since_first_seen"),
-                 r.get("classified_size"), r.get("classified_evaluation"),
-                 r.get("certificate_end"), r.get("feature_version"),
-                 r.get("built_at") or _now()),
-            )
+        self.conn.executemany(
+            f"INSERT INTO feature_cr_month ({', '.join(cols)})"
+            f" VALUES ({', '.join('?' * len(cols))})",
+            [[r.get(c) if c != "built_at" else (r.get(c) or _now())
+              for c in cols] for r in rows])
         self.conn.commit()
         return len(rows)
 
@@ -667,8 +935,14 @@ class Store:
             )
         self.conn.commit()
 
-    def clear_matches(self) -> None:
-        self.conn.execute("DELETE FROM match")
+    def clear_matches(self, customer_ids: Iterable[str] | None = None) -> None:
+        """Clear all matches, or only those of the given customers -- so a
+        re-run never leaves yesterday's matches next to today's."""
+        if customer_ids is None:
+            self.conn.execute("DELETE FROM match")
+        else:
+            self.conn.executemany("DELETE FROM match WHERE customer_id=?",
+                                  [(c,) for c in set(customer_ids)])
         self.conn.commit()
 
     # -- reads ----------------------------------------------------------
@@ -677,8 +951,28 @@ class Store:
             "SELECT c.*, t.awarded_date, t.ministry, t.awarded_amount"
             " FROM company c JOIN tender t USING (tender_id)").fetchall()
 
+    def history(self, tender_id: str) -> dict[str, Any]:
+        """Everything recorded about one tender: its lifecycle as the crawl
+        saw it, which pages were read at which state, and its companies."""
+        q = self.conn.execute
+        return {
+            "tender": q("SELECT * FROM tender WHERE tender_id=?",
+                        (tender_id,)).fetchone(),
+            "sightings": q("SELECT * FROM sighting WHERE tender_id=?"
+                           " ORDER BY first_seen, kind",
+                           (tender_id,)).fetchall(),
+            "fetches": q("SELECT * FROM detail_fetch WHERE tender_id=?"
+                         " ORDER BY page_type", (tender_id,)).fetchall(),
+            "companies": q("SELECT role, stage, seq, name, cr_number, value"
+                           " FROM company WHERE tender_id=?"
+                           " ORDER BY role, seq", (tender_id,)).fetchall(),
+            "failures": q("SELECT * FROM failed_page WHERE ref=? OR ref LIKE ?",
+                          (tender_id, f"{tender_id}@%")).fetchall(),
+        }
+
     def stats(self) -> dict[str, Any]:
         q = self.conn.execute
+
         def one(sql, *a):
             r = q(sql, a).fetchone()
             return r[0] if r else None
@@ -687,6 +981,7 @@ class Store:
             "detail pages stored": one("SELECT COUNT(*) FROM raw_page WHERE kind='detail'"),
             "tenders": one("SELECT COUNT(*) FROM tender"),
             "tenders with award date": one("SELECT COUNT(*) FROM tender WHERE awarded_date IS NOT NULL"),
+            "tenders listed nowhere now": len(self.left_every_list()),
             "award rows": one("SELECT COUNT(*) FROM company WHERE role='awarded'"),
             "bidder rows": one("SELECT COUNT(*) FROM company WHERE role='bidder'"),
             "distinct companies": one("SELECT COUNT(DISTINCT COALESCE(cr_root, name_normalised)) FROM company"),
@@ -695,9 +990,11 @@ class Store:
             "latest award": one("SELECT MAX(awarded_date) FROM tender WHERE awarded_date IS NOT NULL"),
             "total awarded QAR": one("SELECT ROUND(SUM(awarded_amount),2) FROM tender"),
             "classified companies": one("SELECT COUNT(*) FROM classified_company"),
+            "classified, delisted": one("SELECT COUNT(*) FROM classified_company WHERE delisted_at IS NOT NULL"),
             "company activities": one("SELECT COUNT(*) FROM company_activity"),
             "tender activities": one("SELECT COUNT(*) FROM tender_activity"),
             "matches": one("SELECT COUNT(*) FROM match"),
+            "matches needing review": one("SELECT COUNT(*) FROM match WHERE method IN ('name_fuzzy', 'name_translit')"),
             "feature rows": one("SELECT COUNT(*) FROM feature_cr_month"),
             "pages awaiting retry": one("SELECT COUNT(*) FROM failed_page"),
             "last run": one("SELECT finished_at FROM run WHERE finished_at"
@@ -710,3 +1007,12 @@ class Store:
             " SUM(awarded_amount) value FROM tender"
             " WHERE family IS NOT NULL GROUP BY family, state"
             " ORDER BY family, state").fetchall()
+
+
+def _kind_for(family: str | None, state: str | None) -> str | None:
+    """The listing section for a (family, state) pair."""
+    from .parse import LISTING_KINDS
+    for kind, spec in LISTING_KINDS.items():
+        if spec["state"] == state and spec["family"] == (family or "tender"):
+            return kind
+    return None

@@ -46,9 +46,12 @@ class Blocked(RuntimeError):
 class PageTimeout(Blocked):
     """The server did not answer in time.
 
-    Some register pages take over a minute to render even in a browser, so a
-    timeout on one page says nothing about the next. Callers skip it, record
-    it, and retry it on the next run.
+    Register pages are rendered with every company's activity table inside
+    them; page 2 (145 activity rows) took 30.8 s cold against the old 30 s
+    timeout, which is the ReadTimeout seen in Sept 2026. A browser that shows
+    it in 5 s is usually showing a cached copy. A timeout on one page says
+    nothing about the next, so callers skip it, record it, and retry it on
+    the next run.
     """
 
 
@@ -137,13 +140,29 @@ def ssl_candidates() -> list[tuple[str, ssl.SSLContext | None]]:
     return out
 
 
+def decode_body(resp) -> str:
+    """Response text, UTF-8 unless the server names another charset.
+
+    requests falls back to ISO-8859-1 for text/html without a charset, which
+    would turn every Arabic character into mojibake. The site serves UTF-8.
+    """
+    ctype = str(resp.headers.get("Content-Type", "")).lower()
+    if "charset=" in ctype:
+        return resp.text
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return resp.content.decode(resp.apparent_encoding or "utf-8",
+                                   errors="replace")
+
+
 @dataclass
 class Fetcher:
     base: str = BASE
     delay: float = 1.5           # seconds between requests
     jitter: float = 0.7          # +/- random seconds on top
     connect_timeout: float = 15.0
-    read_timeout: float = 90.0   # some pages take a minute to render
+    read_timeout: float = 120.0  # some pages take a minute or more to render
     max_retries: int = 3
     timeout_retries: int = 2     # a page that hangs twice will hang again
     respect_robots: bool = True
@@ -161,6 +180,7 @@ class Fetcher:
 
     def _new_session(self, candidate) -> None:
         name, ctx = candidate
+        self._candidate = candidate
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.cookies.set(
@@ -203,6 +223,19 @@ class Fetcher:
             f"No TLS setting worked for {self.base}. Tried:\n"
             + "\n".join(errors)
             + "\n\nRun  python -m monaqasat doctor  for a full diagnosis.")
+
+    def _rebuild(self) -> None:
+        """Fresh session and connection pool, same TLS setting.
+
+        After a timeout or a dropped connection the pooled keep-alive socket
+        is the usual suspect; retrying on it can hang again.
+        """
+        candidate = getattr(self, "_candidate", None) or self._candidates[0]
+        try:
+            self.session.close()
+        except Exception:                          # noqa: BLE001, S110
+            pass
+        self._new_session(candidate)
 
     # -- robots ---------------------------------------------------------
     def check_robots(self) -> str:
@@ -257,6 +290,7 @@ class Fetcher:
                     raise PageTimeout(
                         f"{url}: no answer within {self.read_timeout:.0f}s, "
                         f"{timeouts} attempts") from exc
+                self._rebuild()
                 time.sleep(backoff)
                 backoff *= 2
                 continue
@@ -264,16 +298,18 @@ class Fetcher:
                 if attempt >= self.max_retries:
                     raise Blocked(f"{url}: {type(exc).__name__}: "
                                   f"{str(exc)[:160]}") from exc
+                self._rebuild()
                 time.sleep(backoff)
                 backoff *= 2
                 continue
 
-            if resp.status_code == 200 and not looks_rejected(resp.text):
-                return resp.text, resp.status_code
+            text = decode_body(resp)
+            if resp.status_code == 200 and not looks_rejected(text):
+                return text, resp.status_code
 
             if attempt >= self.max_retries:
                 reason = ("firewall rejected the request"
-                          if looks_rejected(resp.text)
+                          if looks_rejected(text)
                           else f"HTTP {resp.status_code}")
                 raise Blocked(f"{url}: {reason} after {attempt} attempts. "
                               "Slow down (--delay), or try again later.")

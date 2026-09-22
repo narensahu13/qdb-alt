@@ -1,27 +1,51 @@
 """Customers -> award records.
 
-Three passes, best evidence first. Every match records which pass produced
-it, so you can report on CR matches alone and treat fuzzy name matches as
-needing a look.
+Four methods, best evidence first. Every match records which one produced
+it, so CR matches can be used as they are and the rest treated as needing
+a look.
 
-  cr          commercial registration number, digits before any branch
-              suffix. Exact, and the reason this source is worth having:
-              QDB already holds the CR number for every borrower, so this is
-              a join, not a guess.
-  name_exact  identical normalised names.
-  name_fuzzy  token-set similarity above the threshold. Reported with the
-              score and the matched string so a human can check it.
+  cr             commercial registration number, digits before any branch
+                 suffix. Exact, and the reason this source is worth having:
+                 QDB already holds the CR number for every borrower, so this
+                 is a join, not a guess.
+  name_exact     identical normalised names in the same script (score 1.0),
+                 or the same words in a different order (0.99).
+  name_fuzzy     token-sort similarity >= the threshold (default 0.92), same
+                 script. Needs review.
+  name_translit  an Arabic name against a Latin one (or the reverse),
+                 compared as consonant skeletons of the whole name. The only
+                 way to join an Arabic-only customer without a CR. Needs
+                 review.
+
+What this deliberately does not do any more (it did in the first qdb-alt
+commit, and it matched borrowers to unrelated companies):
+  - score a pair 0.92-1.0 because the first words share consonants
+    ("Qatar Packaging" = every "QATAR ..." company);
+  - treat equal consonant skeletons as an exact match
+    ("Nasser Trading" = "Nisr Trading");
+  - compare every customer with every company (hours on a real book).
 """
 
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
-from .normalize import (arabic_to_latin, canonical_key, consonant_skeleton,
-                        cr_root, is_arabic, match_keys, normalize_name,
-                        similarity)
+from .normalize import (MIN_SKELETON, canonical_key, cr_root, is_arabic,
+                        normalize_name, skeleton_forms,
+                        token_sort_similarity)
+
+try:
+    from rapidfuzz import fuzz as _rf_fuzz
+    from rapidfuzz import process as _rf_process
+except ImportError:                      # pragma: no cover
+    _rf_fuzz = _rf_process = None
+
+FUZZY_THRESHOLD = 0.92
+TRANSLIT_THRESHOLD = 0.90
+REVIEW_METHODS = ("name_fuzzy", "name_translit")
+METHODS = ("cr", "name_exact") + REVIEW_METHODS
 
 
 # --------------------------------------------------------------------------
@@ -193,11 +217,13 @@ def load_customers_report(path: str | Path, sheet: str | None = None
     for row in data:
         name = cell(row, "name")
         cr = cell(row, "cr_number")
-        if not name and not cr:
+        name_ar = cell(row, "name_ar") or None
+        # A row with only an Arabic name is still a customer (it used to be
+        # dropped as empty).
+        if not name and not cr and not name_ar:
             skipped += 1
             continue
-        cid = cell(row, "customer_id") or name or cr
-        name_ar = cell(row, "name_ar") or None
+        cid = cell(row, "customer_id") or name or name_ar or cr
         if not name_ar and is_arabic(name):
             name_ar = name
         out.append({"customer_id": cid, "name": name,
@@ -206,7 +232,20 @@ def load_customers_report(path: str | Path, sheet: str | None = None
 
     report["rows"] = len(out)
     report["skipped (no name, no CR)"] = skipped
-    report["with CR number"] = sum(1 for r in out if r["cr_number"])
+    # What each row can be matched on. A CR that does not parse is as good
+    # as no CR, so it is counted -- and shown -- separately.
+    unreadable = [r for r in out if r["cr_number"] and not cr_root(r["cr_number"])]
+    no_cr = [r for r in out if not cr_root(r["cr_number"])]
+    report["with CR number"] = len(out) - len(no_cr)
+    report["no CR, English name"] = sum(
+        1 for r in no_cr if r["name"] and not is_arabic(r["name"]))
+    report["no CR, Arabic name only"] = sum(
+        1 for r in no_cr if (r["name_ar"] or r["name"])
+        and not (r["name"] and not is_arabic(r["name"])))
+    if unreadable:
+        report["warnings"].append(
+            f"{len(unreadable)} CR value(s) contain no number, e.g. "
+            + ", ".join(repr(r["cr_number"]) for r in unreadable[:3]))
     if "customer_id" not in mapping:
         report["warnings"].append("no customer id column -- using the name "
                                   "(or CR) as the id")
@@ -233,8 +272,16 @@ def print_load_report(report: dict[str, Any]) -> None:
     for field in ("customer_id", "name", "cr_number", "name_ar"):
         if field in cols:
             print(f"  {field:<13} <- column '{cols[field]}'")
-    print(f"  rows          {report['rows']}"
-          f"  ({report['with CR number']} with a CR number)")
+    print(f"  rows          {report['rows']}")
+    print(f"    with a CR number          {report['with CR number']:>6}"
+          "   joined exactly")
+    if report.get("no CR, English name"):
+        print(f"    no CR, English name       {report['no CR, English name']:>6}"
+              "   joined by name; similar-name matches need review")
+    if report.get("no CR, Arabic name only"):
+        print(f"    no CR, Arabic name only   "
+              f"{report['no CR, Arabic name only']:>6}"
+              "   joined by transliteration only; review, or add the CR")
     if report["skipped (no name, no CR)"]:
         print(f"  skipped       {report['skipped (no name, no CR)']} "
               "empty rows")
@@ -251,74 +298,199 @@ def _field(row: Any, key: str, default=None):
     return default if value is None else value
 
 
-def _index_name(row: Any, by_name: dict, by_key: dict) -> None:
-    for raw in (_field(row, "name", ""), _field(row, "name_ar", ""),
-                _field(row, "name_normalised", "")):
-        if not raw:
-            continue
-        for key in match_keys(raw):
-            by_name.setdefault(key, []).append(row)
-            by_key.setdefault(key, []).append(row)
-        if not is_arabic(raw):
-            n = normalize_name(raw)
-            if n:
-                by_name.setdefault(n, []).append(row)
-                by_key.setdefault(canonical_key(raw), []).append(row)
+# --------------------------------------------------------------------------
+# matching
+#
+# The candidate list (company rows, or the classified register) is indexed
+# once. A customer is then compared only with names that share one of its
+# two rarest words (fuzzy), or whose skeleton is close (translit), instead
+# of with every name on the list.
+# --------------------------------------------------------------------------
+
+class _Names:
+    """Unique normalised names in one script, with a word index."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+        self.rows: list[list[Any]] = []
+        self._pos: dict[str, int] = {}
+        self.postings: dict[str, list[int]] = {}
+
+    def add(self, norm: str, row: Any) -> None:
+        i = self._pos.get(norm)
+        if i is None:
+            i = self._pos[norm] = len(self.names)
+            self.names.append(norm)
+            self.rows.append([])
+            for tok in set(norm.split()):
+                self.postings.setdefault(tok, []).append(i)
+        self.rows[i].append(row)
+
+    def candidates(self, query: str, words: int = 2) -> set[int]:
+        present = [t for t in set(query.split()) if t in self.postings]
+        present.sort(key=lambda t: len(self.postings[t]))
+        out: set[int] = set()
+        for t in present[:words]:
+            out.update(self.postings[t])
+        return out
 
 
-def _customer_keys(cust: dict[str, Any]) -> set[str]:
-    keys: set[str] = set()
-    for raw in (cust.get("name"), cust.get("name_ar")):
-        if not raw:
-            continue
-        keys |= match_keys(raw)
-        if not is_arabic(raw):
-            n = normalize_name(raw)
-            if n:
-                keys.add(n)
-                keys.add(canonical_key(raw))
-        else:
-            latin = arabic_to_latin(raw)
-            if latin:
-                keys.add(latin)
-                keys.add(canonical_key(latin))
-    return {k for k in keys if k}
+class _Skeletons:
+    """Space-free consonant skeletons of names in one script."""
+
+    def __init__(self) -> None:
+        self.skels: list[str] = []
+        self.rows: list[list[Any]] = []
+        self._pos: dict[str, int] = {}
+        self._by_prefix: dict[str, list[int]] = {}
+
+    def add(self, sk: str, row: Any) -> None:
+        if len(sk) < MIN_SKELETON:
+            return
+        i = self._pos.get(sk)
+        if i is None:
+            i = self._pos[sk] = len(self.skels)
+            self.skels.append(sk)
+            self.rows.append([])
+            self._by_prefix.setdefault(sk[:2], []).append(i)
+        self.rows[i].append(row)
+
+    def search(self, sk: str, threshold: float) -> list[tuple[int, float]]:
+        if len(sk) < MIN_SKELETON or not self.skels:
+            return []
+        if _rf_process is not None:
+            hits = _rf_process.extract(sk, self.skels, scorer=_rf_fuzz.ratio,
+                                       score_cutoff=threshold * 100,
+                                       limit=None)
+            return [(i, score / 100.0) for _, score, i in hits]
+        import difflib
+        out = []
+        for i in self._by_prefix.get(sk[:2], []):
+            score = difflib.SequenceMatcher(None, sk, self.skels[i]).ratio()
+            if score >= threshold:
+                out.append((i, score))
+        return out
+
+
+class NameIndex:
+    """CR, exact, fuzzy and transliteration lookups over a list of rows."""
+
+    def __init__(self, rows: Iterable[Any], name_fields=("name",)) -> None:
+        self.by_cr: dict[str, list[Any]] = {}
+        self.exact: dict[str, list[Any]] = {}
+        self.canon: dict[str, list[Any]] = {}
+        self.latin = _Names()
+        self.arabic = _Names()
+        self.skel_latin = _Skeletons()      # searched by Arabic names
+        self.skel_arabic = _Skeletons()     # searched by Latin names
+        for row in rows:
+            root = _field(row, "cr_root") or cr_root(_field(row, "cr_number"))
+            if root:
+                self.by_cr.setdefault(root, []).append(row)
+            seen: set[str] = set()
+            for f in name_fields:
+                raw = _field(row, f)
+                if not raw or raw in seen:
+                    continue
+                seen.add(raw)
+                norm = normalize_name(raw)
+                if not norm:
+                    continue
+                arabic = is_arabic(raw)
+                self.exact.setdefault(norm, []).append(row)
+                self.canon.setdefault(canonical_key(raw), []).append(row)
+                (self.arabic if arabic else self.latin).add(norm, row)
+                target = self.skel_arabic if arabic else self.skel_latin
+                for sk in skeleton_forms(raw):
+                    target.add(sk, row)
+
+    def lookup(self, cust: dict[str, Any], *,
+               fuzzy_threshold: float = FUZZY_THRESHOLD,
+               translit_threshold: float = TRANSLIT_THRESHOLD,
+               ) -> Iterable[tuple[Any, str, float]]:
+        """Yield (row, method, score) for one customer, best evidence first."""
+        root = cr_root(cust.get("cr_number"))
+        if root:
+            for row in self.by_cr.get(root, []):
+                yield row, "cr", 1.0
+
+        names: list[str] = []
+        for raw in (cust.get("name"), cust.get("name_ar")):
+            if raw and raw not in names:
+                names.append(raw)
+
+        for raw in names:
+            norm = normalize_name(raw)
+            if not norm:
+                continue
+            for row in self.exact.get(norm, []):
+                yield row, "name_exact", 1.0
+            for row in self.canon.get(canonical_key(raw), []):
+                yield row, "name_exact", 0.99
+
+            if fuzzy_threshold < 1.0:
+                side = self.arabic if is_arabic(raw) else self.latin
+                for i in side.candidates(norm):
+                    cand = side.names[i]
+                    if cand == norm:
+                        continue
+                    score = token_sort_similarity(norm, cand)
+                    if score >= fuzzy_threshold:
+                        for row in side.rows[i]:
+                            yield row, "name_fuzzy", round(score, 3)
+
+            if translit_threshold < 1.0:
+                other = self.skel_latin if is_arabic(raw) else self.skel_arabic
+                for sk in skeleton_forms(raw):
+                    for i, score in other.search(sk, translit_threshold):
+                        for row in other.rows[i]:
+                            yield row, "name_translit", round(score, 3)
+
+
+def _run(customers: Iterable[dict[str, Any]], index: NameIndex,
+         key: Callable[[dict[str, Any], Any], tuple],
+         emit: Callable[[dict[str, Any], Any, str, float], dict[str, Any]],
+         fuzzy_threshold: float, translit_threshold: float
+         ) -> list[dict[str, Any]]:
+    best: dict[tuple, dict[str, Any]] = {}
+    rank = {m: i for i, m in enumerate(METHODS)}
+    for cust in customers:
+        for row, method, score in index.lookup(
+                cust, fuzzy_threshold=fuzzy_threshold,
+                translit_threshold=translit_threshold):
+            k = key(cust, row)
+            old = best.get(k)
+            # Better method wins; within a method, the higher score.
+            if old is not None and (rank[old["method"]], -old["score"]) <= (
+                    rank[method], -score):
+                continue
+            best[k] = emit(cust, row, method, score)
+    return list(best.values())
 
 
 def match_customers(
     customers: Iterable[dict[str, Any]],
     companies: Iterable[Any],
     *,
-    fuzzy_threshold: float = 0.90,
+    fuzzy_threshold: float = FUZZY_THRESHOLD,
+    translit_threshold: float = TRANSLIT_THRESHOLD,
 ) -> list[dict[str, Any]]:
     """Return one row per (customer, tender, role, company row) match.
 
-    Order: CR number, then exact Latin/Arabic key, then fuzzy. An Arabic
-    customer name is transliterated before it is compared to Monaqasat's
-    English (often machine-transliterated) company name.
+    Keyed on the company row, not just the tender: a tender can have several
+    winners, and a borrower must only ever be credited with its own line.
+    Each company row is matched by its best method only.
     """
-    companies = list(companies)
+    index = NameIndex(companies)
 
-    by_cr: dict[str, list[Any]] = {}
-    by_name: dict[str, list[Any]] = {}
-    by_key: dict[str, list[Any]] = {}
-    for c in companies:
-        root = _field(c, "cr_root") or cr_root(_field(c, "cr_number"))
-        if root:
-            by_cr.setdefault(root, []).append(c)
-        _index_name(c, by_name, by_key)
+    def key(cust, comp):
+        return (cust["customer_id"], comp["tender_id"], comp["role"],
+                comp["seq"])
 
-    matches: dict[tuple[str, str, str, int], dict[str, Any]] = {}
-
-    def record(cust, comp, method, score):
-        key = (cust["customer_id"], comp["tender_id"], comp["role"],
-               comp["seq"])
-        existing = matches.get(key)
-        if existing and existing["score"] >= score:
-            return
-        matches[key] = {
+    def emit(cust, comp, method, score):
+        return {
             "customer_id": cust["customer_id"],
-            "customer_name": cust["name"],
+            "customer_name": cust.get("name"),
             "tender_id": comp["tender_id"],
             "role": comp["role"],
             "seq": comp["seq"],
@@ -328,81 +500,27 @@ def match_customers(
             "matched_cr": _field(comp, "cr_number"),
         }
 
-    for cust in customers:
-        root = cr_root(cust.get("cr_number"))
-        if root:
-            for comp in by_cr.get(root, []):
-                record(cust, comp, "cr", 1.0)
-
-        names = _customer_keys(cust)
-        for key in names:
-            for comp in by_name.get(key, []):
-                record(cust, comp, "name_exact", 1.0)
-            for comp in by_key.get(key, []):
-                record(cust, comp, "name_exact", 0.99)
-
-        if names and fuzzy_threshold < 1.0:
-            for query in names:
-                first = query.split()[0] if query else ""
-                if not first:
-                    continue
-                q_sk = consonant_skeleton(first)
-                for cand_name, comps in by_name.items():
-                    c0 = cand_name.split()[0] if cand_name else ""
-                    same_stem = bool(q_sk) and len(q_sk) >= 3 \
-                        and q_sk == consonant_skeleton(c0)
-                    if not (same_stem or cand_name.startswith(first)
-                            or first in cand_name or c0 in query):
-                        continue
-                    score = similarity(query, cand_name)
-                    if same_stem:
-                        score = max(score, similarity(first, c0), 0.92)
-                    if score >= fuzzy_threshold:
-                        for comp in comps:
-                            record(cust, comp, "name_fuzzy", round(score, 3))
-
-    return list(matches.values())
-
-
-def summarise(matches: list[dict[str, Any]]) -> dict[str, Any]:
-    customers = {m["customer_id"] for m in matches}
-    return {
-        "matches": len(matches),
-        "customers matched": len(customers),
-        "by method": {
-            m: sum(1 for x in matches if x["method"] == m)
-            for m in ("cr", "name_exact", "name_fuzzy")
-        },
-        "awarded": sum(1 for m in matches if m["role"] == "awarded"),
-        "bid only": sum(1 for m in matches if m["role"] == "bidder"),
-    }
+    return _run(customers, index, key, emit, fuzzy_threshold,
+                translit_threshold)
 
 
 def match_classified(
     customers: Iterable[dict[str, Any]],
     register: Iterable[Any],
     *,
-    fuzzy_threshold: float = 0.90,
+    fuzzy_threshold: float = FUZZY_THRESHOLD,
+    translit_threshold: float = TRANSLIT_THRESHOLD,
 ) -> list[dict[str, Any]]:
     """Join customers to the classified-company register."""
-    by_cr: dict[str, list[Any]] = {}
-    by_name: dict[str, list[Any]] = {}
-    for row in register:
-        root = _field(row, "cr_root") or cr_root(_field(row, "cr_number"))
-        if root:
-            by_cr.setdefault(root, []).append(row)
-        _index_name(row, by_name, {})
+    index = NameIndex(register)
 
-    hits: dict[tuple[str, Any], dict[str, Any]] = {}
+    def key(cust, row):
+        return (cust["customer_id"], _field(row, "profile_number"))
 
-    def record(cust, row, method, score):
-        key = (cust["customer_id"], _field(row, "profile_number"))
-        existing = hits.get(key)
-        if existing and existing["score"] >= score:
-            return
-        hits[key] = {
+    def emit(cust, row, method, score):
+        return {
             "customer_id": cust["customer_id"],
-            "customer_name": cust["name"],
+            "customer_name": cust.get("name"),
             "profile_number": _field(row, "profile_number"),
             "method": method,
             "score": score,
@@ -413,32 +531,19 @@ def match_classified(
             "certificate_end": _field(row, "certificate_end"),
         }
 
-    for cust in customers:
-        root = cr_root(cust.get("cr_number"))
-        if root:
-            for row in by_cr.get(root, []):
-                record(cust, row, "cr", 1.0)
-        names = _customer_keys(cust)
-        for key in names:
-            for row in by_name.get(key, []):
-                record(cust, row, "name_exact", 1.0)
-        if names and fuzzy_threshold < 1.0:
-            for query in names:
-                first = query.split()[0] if query else ""
-                if not first:
-                    continue
-                q_sk = consonant_skeleton(first)
-                for cand_name, rows in by_name.items():
-                    c0 = cand_name.split()[0] if cand_name else ""
-                    same_stem = bool(q_sk) and len(q_sk) >= 3 \
-                        and q_sk == consonant_skeleton(c0)
-                    if not (same_stem or cand_name.startswith(first)
-                            or first in cand_name or c0 in query):
-                        continue
-                    score = similarity(query, cand_name)
-                    if same_stem:
-                        score = max(score, similarity(first, c0), 0.92)
-                    if score >= fuzzy_threshold:
-                        for row in rows:
-                            record(cust, row, "name_fuzzy", round(score, 3))
-    return list(hits.values())
+    return _run(customers, index, key, emit, fuzzy_threshold,
+                translit_threshold)
+
+
+def summarise(matches: list[dict[str, Any]]) -> dict[str, Any]:
+    customers = {m["customer_id"] for m in matches}
+    by_method = {m: sum(1 for x in matches if x["method"] == m)
+                 for m in METHODS}
+    return {
+        "matches": len(matches),
+        "customers matched": len(customers),
+        "by method": by_method,
+        "needs review": sum(by_method[m] for m in REVIEW_METHODS),
+        "awarded": sum(1 for m in matches if m["role"] == "awarded"),
+        "bid only": sum(1 for m in matches if m["role"] == "bidder"),
+    }

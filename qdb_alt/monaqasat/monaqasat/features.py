@@ -4,6 +4,14 @@ Point-in-time: a feature dated ``as_of`` only uses tenders whose event date
 is on or before ``as_of``. The event date is ``awarded_date``, falling back
 to ``closing_date``. Classified-register fields are a current snapshot, not
 a history -- they are attached as of the latest month only.
+
+v2 (Sept 2026 fixes):
+  - an award's value is the sum of the company's Approved Value lines on
+    that tender (v1 took the smallest line, and fell back to the proposal
+    amount);
+  - win rate is wins / decided tenders, where decided means the winners are
+    known. v1 divided by every appearance, so bids still under evaluation
+    counted as losses (one win + three pending bids gave 0.25, not 1.0).
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from typing import Any
 
 from .store import Store, _now
 
-FEATURE_VERSION = "v1"
+FEATURE_VERSION = "v2"
 
 
 def month_end(year: int, month: int) -> date:
@@ -58,6 +66,12 @@ def build_features(store: Store, months: int = 60,
         " WHERE c.cr_root IS NOT NULL"
     ).fetchall()
 
+    # Decided = the winners are known: any awarded row, with or without a
+    # CR. A tender still in technical or financial evaluation, or
+    # cancelled, has none and is neither a win nor a loss for anyone on it.
+    decided_tenders = {r[0] for r in store.conn.execute(
+        "SELECT DISTINCT tender_id FROM company WHERE role='awarded'")}
+
     by_tender: dict[str, list] = defaultdict(list)
     for r in rows:
         event = _parse_iso(r["awarded_date"]) or _parse_iso(r["closing_date"])
@@ -69,22 +83,22 @@ def build_features(store: Store, months: int = 60,
     for tender_id, entries in by_tender.items():
         event = entries[0][1]
         winners = {r["cr_root"] for r, _ in entries if r["role"] == "awarded"}
-        amounts: dict[str, float] = {}
+        decided = tender_id in decided_tenders
+        awarded_value: dict[str, float] = defaultdict(float)
+        has_award_value: set[str] = set()
         for r, _ in entries:
-            if r["value"] is None:
-                continue
-            current = amounts.get(r["cr_root"])
-            if current is None or r["value"] < current:
-                amounts[r["cr_root"]] = r["value"]
+            if r["role"] == "awarded" and r["value"] is not None:
+                awarded_value[r["cr_root"]] += r["value"]
+                has_award_value.add(r["cr_root"])
         crs = {r["cr_root"] for r, _ in entries}
         ministry = next((r["ministry"] for r, _ in entries if r["ministry"]), None)
         for cr in crs:
-            rest = [v for other, v in amounts.items() if other != cr]
             history[cr].append({
                 "information_date": event,
                 "won": cr in winners,
-                "own_amount": amounts.get(cr),
-                "best_other": min(rest) if rest else None,
+                "decided": decided,
+                "own_amount": (round(awarded_value[cr], 2)
+                               if cr in has_award_value else None),
                 "ministry": ministry,
             })
 
@@ -133,6 +147,7 @@ def _features_for(cr_root: str, as_of: date, events: list[dict[str, Any]],
     cutoff_12m = as_of - timedelta(days=365)
     cutoff_36m = as_of - timedelta(days=365 * 3)
     window_12m = [p for p in visible if p["information_date"] > cutoff_12m]
+    decided_12m = [p for p in window_12m if p["decided"]]
     wins_12m = [p for p in window_12m if p["won"]]
     wins_36m = [p for p in visible if p["won"] and p["information_date"] > cutoff_36m]
     wins_all = [p for p in visible if p["won"]]
@@ -160,9 +175,11 @@ def _features_for(cr_root: str, as_of: date, events: list[dict[str, Any]],
         "months_since_last_award": (
             _months_between(last_award, as_of) if last_award else None),
         "bids_12m_count": len(window_12m),
+        "decided_12m_count": len(decided_12m),
         "wins_12m_count": len(wins_12m),
         "win_rate_12m": (
-            round(len(wins_12m) / len(window_12m), 4) if len(window_12m) >= 3 else None),
+            round(len(wins_12m) / len(decided_12m), 4)
+            if len(decided_12m) >= 3 else None),
         "distinct_buyers_12m": len({p["ministry"] for p in wins_12m if p["ministry"]}),
         "top_buyer_share_12m": (
             round(max(buyer_values.values()) / sum(buyer_values.values()), 4)
