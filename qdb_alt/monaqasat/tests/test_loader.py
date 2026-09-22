@@ -172,5 +172,27 @@ class Excel(unittest.TestCase):
         self.assertEqual(len(out), 1)
 
 
+
+class WhatCanBeMatched(unittest.TestCase):
+    """The load report says how each customer can be joined."""
+
+    def test_counts_by_what_each_row_carries(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.csv"
+            p.write_text(
+                "customer_id,name,name_ar,cr_number\n"
+                "C1,ACME TRADING,,12345\n"
+                "C2,BETA TRADING,,\n"
+                f"C3,,{ARABIC_NAME},\n"
+                f"C4,{ARABIC_NAME},,\n"
+                "C5,GAMMA,,N/A\n", encoding="utf-8")
+            out, rep = load_customers_report(p)
+        self.assertEqual(rep["with CR number"], 1)
+        self.assertEqual(rep["no CR, English name"], 2)      # C2, C5
+        self.assertEqual(rep["no CR, Arabic name only"], 2)  # C3, C4
+        self.assertTrue(any("contain no number" in w for w in rep["warnings"]))
+        self.assertEqual(out[3]["name_ar"], ARABIC_NAME)     # C4: name is Arabic
+
+
 if __name__ == "__main__":
     unittest.main()

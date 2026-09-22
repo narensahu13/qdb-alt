@@ -104,5 +104,67 @@ class Features(unittest.TestCase):
             store.close()
 
 
+
+class FeatureFixes(unittest.TestCase):
+    """Two v1 errors, found in the 22 Sept 2026 review."""
+
+    def _store(self, tmp):
+        store = Store(str(Path(tmp) / "t.db"))
+        store.upsert_tender({"tender_id": "A", "family": "tender",
+                             "state": "awarded", "awarded_date": "2026-03-01",
+                             "ministry": "Ashghal"})
+        store.replace_companies("A", [
+            {"role": "awarded", "seq": 0, "name": "B CO", "cr_number": "500",
+             "value": 600000.0, "stage": "awarded"},
+            {"role": "awarded", "seq": 1, "name": "B CO", "cr_number": "500",
+             "value": 400000.0, "stage": "awarded"},
+            {"role": "bidder", "seq": 0, "name": "B CO", "cr_number": "500",
+             "value": 1000000.0, "stage": "financial"}])
+        for i, t in enumerate(("P1", "P2", "P3")):
+            store.upsert_tender({"tender_id": t, "family": "tender",
+                                 "state": "technical",
+                                 "closing_date": "2026-05-01",
+                                 "ministry": "HMC"})
+            store.replace_companies(t, [
+                {"role": "bidder", "seq": 0, "name": "B CO",
+                 "cr_number": "500", "value": None, "stage": "technical"}])
+        for t, winner in (("D1", "600"), ("D2", "600"), ("D3", "500")):
+            store.upsert_tender({"tender_id": t, "family": "tender",
+                                 "state": "awarded",
+                                 "awarded_date": "2026-04-01"})
+            store.replace_companies(t, [
+                {"role": "awarded", "seq": 0, "name": "W", "cr_number": winner,
+                 "value": 10.0, "stage": "awarded"},
+                {"role": "bidder", "seq": 0, "name": "B CO",
+                 "cr_number": "500", "value": 12.0, "stage": "financial"}])
+        store.commit()
+        build_features(store, months=3, as_of_end=date(2026, 6, 30))
+        return store
+
+    def _last(self, store, cr):
+        return store.conn.execute(
+            "SELECT * FROM feature_cr_month WHERE cr_root=?"
+            " ORDER BY as_of_month DESC LIMIT 1", (cr,)).fetchone()
+
+    def test_award_value_is_the_sum_of_the_lines(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            r = self._last(store, "500")
+            # 600k + 400k on A, plus 10 on D3 -- not the smallest line
+            self.assertEqual(r["awards_12m_value"], 1000010.0)
+            self.assertEqual(r["largest_award_12m"], 1000000.0)
+            store.close()
+
+    def test_bids_still_under_evaluation_are_not_losses(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            r = self._last(store, "500")
+            self.assertEqual(r["bids_12m_count"], 7)     # A, P1-3, D1-3
+            self.assertEqual(r["decided_12m_count"], 4)  # A, D1-3
+            self.assertEqual(r["wins_12m_count"], 2)     # A, D3
+            self.assertEqual(r["win_rate_12m"], 0.5)     # v1 said 2/7
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ point of incremental crawling is the requests it does not make.
 
 import unittest
 from argparse import Namespace
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -23,33 +24,56 @@ CARD = ('<div class="row custom-cards"><div class="col-md-7 cards-col">'
         '</span><span class="card-title"><a href="/TendersOnlineServices/'
         'TenderDetails/{id}">subject {id}</a></span></div><div class="col-footer">'
         '<div class="cards-row"><span class="card-label"><label>Award date'
-        '</label></span><span class="card-title"><span><label>01/01/2026'
+        '</label></span><span class="card-title"><span><label>{date}'
         '</label></span></span></div></div></div><div class="col-md-3 cards-col">'
         '<div class="col-header"><span class="card-label"><label>Ministry</label>'
         '</span><span class="card-title"><span>Ministry {id}</span></span></div>'
         '</div><div class="col-md-2"><a href="/TendersOnlineServices/'
         'TenderCompaniesDetails/{id}">Report</a></div></div>')
 
+AWARDED_TABLE = ('<h3>Awarded companies data</h3>'
+                 '<table class="custom--table"><thead><tr><th>Company name</th>'
+                 '<th>Commercial Registration Number</th><th>Approved Value</th>'
+                 '<th>Financial Result</th><th>Approved Items</th></tr></thead>'
+                 '<tbody><tr><td>CO {id}</td><td>{id} | 1</td>'
+                 '<td>1,000.00 QAR</td><td></td><td></td></tr></tbody></table>')
+OPENED_TABLE = ('<h3>Technically opened companies data</h3>'
+                '<table class="custom--table"><thead><tr><th>Company name</th>'
+                '<th>Commercial Registration Number</th></tr></thead><tbody>'
+                '<tr><td>CO {id}</td><td>{id} | 1</td></tr>'
+                '<tr><td>OTHER {id}</td><td>9{id} | 2</td></tr>'
+                '</tbody></table>')
+# The live site's companies page grows as a tender advances: names only at
+# technical/financial opening, the winners (and prices) once awarded.
 COMPANIES = ('<html><body><span id="lbl_num">{id}/2026</span>'
-             '<span id="lbl_award">1,000.00</span>'
-             '<table class="custom--table"><thead><tr><th>Company name</th>'
-             '<th>Commercial Registration Number</th><th>Approved Value</th>'
-             '<th>Financial Result</th><th>Approved Items</th></tr></thead>'
-             '<tbody><tr><td>CO {id}</td><td>{id} | 1</td><td>1,000.00 QAR</td>'
-             '<td></td><td></td></tr></tbody></table></body></html>')
+             '<span id="lbl_award">1,000.00</span>{tables}</body></html>')
 
 DETAILS = ('<html><body><table><thead><tr><th>Activity code</th>'
            '<th>Activity name</th></tr></thead><tbody><tr><td>46900</td>'
            '<td>Wholesale</td></tr></tbody></table></body></html>')
 
 
+HOME_PAGE = "<html><body><h2>Welcome to Monaqasat</h2></body></html>"
+
+
+def award_date(tid) -> str:
+    """One award a day, in id order: newest id, newest date -- the order
+    the live Awarded list is in."""
+    d = date(2020, 1, 1) + timedelta(days=int(tid) - 100000)
+    return d.strftime("%d/%m/%Y")
+
+
 class FakeSite:
-    """A newest-first listing per section, served page by page."""
+    """A listing per section, served page by page, newest first unless a
+    test puts a tender somewhere else."""
 
     def __init__(self):
-        self.sections: dict[str, list[str]] = {}   # path -> ids, newest first
+        self.sections: dict[str, list[str]] = {}   # path -> ids, top first
         self.requests: list[str] = []
         self.hang: set[str] = set()                # paths that time out
+        self.home: set[str] = set()                # ids answered with home page
+        self.no_winner_yet: set[str] = set()       # awarded, table not up yet
+        self.dates: dict[str, str] = {}            # id -> award date override
         self._next = 100000
 
     def publish(self, path: str, n: int) -> list[str]:
@@ -62,20 +86,33 @@ class FakeSite:
         self.sections[src].remove(tid)
         self.sections.setdefault(dst, []).insert(0, tid)
 
+    def awarded(self, tid: str) -> bool:
+        return any(tid in ids for path, ids in self.sections.items()
+                   if path.startswith("Awarded"))
+
     def get(self, rel: str):
         self.requests.append(rel)
         if rel in self.hang:
             raise PageTimeout(f"{rel}: no answer")
         parts = rel.strip("/").split("/")
         if parts[1] in ("TenderDetails",):
-            return DETAILS, 200
+            return (HOME_PAGE if parts[2] in self.home else DETAILS), 200
         if parts[1] == "TenderCompaniesDetails":
-            return COMPANIES.format(id=parts[2]), 200
+            tid = parts[2]
+            if tid in self.home:
+                return HOME_PAGE, 200
+            tables = OPENED_TABLE.format(id=tid)
+            if self.awarded(tid) and tid not in self.no_winner_yet:
+                tables = AWARDED_TABLE.format(id=tid) + tables
+            return COMPANIES.format(id=tid, tables=tables), 200
         path, page = parts[1], int(parts[2])
         ids = self.sections.get(path, [])
         last = max(1, -(-len(ids) // PER_PAGE))
+        page = min(page, last)          # the live site: past the end -> last
         chunk = ids[(page - 1) * PER_PAGE: page * PER_PAGE]
-        cards = "".join(CARD.format(id=i, num=f"{i}/2026") for i in chunk)
+        cards = "".join(CARD.format(id=i, num=f"{i}/2026",
+                                    date=self.dates.get(i, award_date(i)))
+                        for i in chunk)
         pager = "".join(f'<a href="/TendersOnlineServices/{path}/{p}">{p}</a>'
                         for p in (1, 2, last))
         return f"<html><body>{cards}<nav>{pager}</nav></body></html>", 200
@@ -90,7 +127,8 @@ class FakeSite:
 def _args(**kw):
     base = dict(db=None, kind="awarded", pages=None, full=False, stop_after=2,
                 limit_details=None, delay=0, timeout=5, listings_only=False,
-                no_details=False)
+                no_details=False, quick=False, lookback_days=14,
+                roll_pages=100, sweep_days=7)
     base.update(kw)
     return Namespace(**base)
 

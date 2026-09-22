@@ -143,5 +143,51 @@ class EnglishCookie(unittest.TestCase):
             "c%3Den%7Cuic%3Den")
 
 
+
+class Resilience(unittest.TestCase):
+    """The ReadTimeout on register page 2 (Sept 2026)."""
+
+    def test_default_timeout_covers_the_slowest_page_seen(self):
+        self.assertGreaterEqual(Fetcher(delay=0).read_timeout, 120)
+
+    def test_a_timeout_gets_a_fresh_connection_before_the_retry(self):
+        f = Fetcher(delay=0, jitter=0)
+        first = f.session
+        ok = requests.Response()
+        ok.status_code = 200
+        ok._content = b"<html>fine</html>"
+        ok.headers["Content-Type"] = "text/html; charset=utf-8"
+        with mock.patch.object(requests.Session, "get",
+                               side_effect=[requests.exceptions.ReadTimeout("slow"),
+                                            ok]), \
+                mock.patch("time.sleep"):
+            text, status = f.get("/ClassifiedCompaniesProfilesList/2")
+        self.assertEqual((text, status), ("<html>fine</html>", 200))
+        self.assertIsNot(f.session, first, "the retry must not reuse the socket")
+        self.assertEqual(f.session.cookies.get(".AspNetCore.Culture"),
+                         "c%3Den%7Cuic%3Den", "the new session still asks for English")
+
+
+class Decoding(unittest.TestCase):
+    def _resp(self, body: bytes, ctype: str):
+        r = requests.Response()
+        r.status_code = 200
+        r._content = body
+        r.headers["Content-Type"] = ctype
+        return r
+
+    def test_arabic_without_a_declared_charset_is_utf8(self):
+        from monaqasat.fetch import decode_body
+        body = "قطر للوقود".encode("utf-8")
+        self.assertEqual(decode_body(self._resp(body, "text/html")), "قطر للوقود")
+
+    def test_a_declared_charset_is_respected(self):
+        from monaqasat.fetch import decode_body
+        body = "café".encode("latin-1")
+        self.assertEqual(
+            decode_body(self._resp(body, "text/html; charset=ISO-8859-1")),
+            "café")
+
+
 if __name__ == "__main__":
     unittest.main()

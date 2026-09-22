@@ -235,7 +235,9 @@ class ArabicNames(unittest.TestCase):
             companies)
         self.assertTrue(m)
         self.assertEqual(m[0]["matched_name"], "AL RAYYAN TRADING WLL")
-        self.assertIn(m[0]["method"], {"name_exact", "name_fuzzy"})
+        # Cross-script matches have their own method so they can be
+        # reviewed separately from same-script ones.
+        self.assertEqual(m[0]["method"], "name_translit")
 
     def test_name_ar_column_used_when_english_name_differs(self):
         companies = [{
@@ -271,6 +273,155 @@ class ArabicNames(unittest.TestCase):
                 companies)
             self.assertTrue(m)
             self.assertEqual({x["method"] for x in m}, {"cr"})
+
+
+
+def _site_row(tid, name, cr=None, role="awarded", seq=0):
+    from monaqasat.normalize import cr_root, normalize_name
+    return {"tender_id": tid, "role": role, "seq": seq, "name": name,
+            "name_normalised": normalize_name(name), "cr_number": cr,
+            "cr_root": cr_root(cr)}
+
+
+SITE = [
+    _site_row("T1", "QATAR NAVIGATION Q.P.S.C", "11"),
+    _site_row("T2", "QATAR ENGINEERING & CONSTRUCTION CO", "12"),
+    _site_row("T3", "GULF WAREHOUSING COMPANY", "13"),
+    _site_row("T4", "GULF DRILLING INTERNATIONAL", "14"),
+    _site_row("T5", "MOHAMMED AL MANA TRADING", "15"),
+    _site_row("T6", "Nisr Trading", "16"),
+    _site_row("T7", "AMANA TRADING WLL", "17"),
+    _site_row("T8", "Duha Trading", "18"),
+    _site_row("T9", "QATAR PRESS", "30163"),
+    _site_row("T10", "قطر للوقود (وقود)", "24872"),
+    _site_row("T11", "Kyrwy Llmqawlat Walnqlyat Walkhdmlt", "99457"),
+]
+
+
+def _cust(cid, name, cr=None, name_ar=None):
+    return {"customer_id": cid, "name": name, "cr_number": cr,
+            "name_ar": name_ar}
+
+
+class NoFalsePositives(unittest.TestCase):
+    """Regressions from the 22 Sept 2026 review. Every customer here is a
+    different company from every site row; none of them may match."""
+
+    def assert_no_match(self, cust):
+        m = match_customers([cust], SITE)
+        self.assertEqual([(x["matched_name"], x["method"], x["score"])
+                          for x in m], [])
+
+    def test_shared_first_word_is_not_a_match(self):
+        # used to match every QATAR company at score 1.0
+        self.assert_no_match(_cust("B1", "Qatar Packaging Co"))
+        self.assert_no_match(_cust("B2", "Gulf Packaging Industries"))
+        self.assert_no_match(_cust("B3", "Mohammed Abdullah Contracting"))
+
+    def test_same_consonants_are_not_an_exact_match(self):
+        # used to be name_exact 1.0 through consonant skeleton keys
+        self.assert_no_match(_cust("B4", "Nasser Trading"))
+        self.assert_no_match(_cust("B5", "Al Amin Trading"))
+        self.assert_no_match(_cust("B6", "Doha Trading"))
+
+    def test_arabic_name_does_not_match_every_qatar_company(self):
+        # قطر للتغليف = Qatar Packaging; used to match all QATAR rows
+        self.assert_no_match(_cust("B7", "قطر للتغليف"))
+
+    def test_false_positive_rate_on_unrelated_names(self):
+        """60 customers not on the site against 6,000 site names. The first
+        qdb-alt matcher produced 13,837 matches here; v0.3 produced 18."""
+        import random
+        rnd = random.Random(11)
+        first = ["Qatar", "Gulf", "Doha", "Al Rayyan", "Al Mana", "Mohammed",
+                 "Abdullah", "Star", "Modern", "United", "Arabian",
+                 "Al Jazeera", "Lusail", "Pearl", "Falcon", "Al Khaleej",
+                 "National", "Al Wakra", "Global", "Future", "Al Noor",
+                 "Al Sadd", "Madina", "Nasser", "Amana", "Al Waha",
+                 "Crystal", "Royal", "Elite", "Smart"]
+        second = ["Blue", "Golden", "Green", "Silver", "Red", "Prime",
+                  "First", "Grand", "Delta", "Alpha", "Omega", "Sky", "Sea",
+                  "Sun", "Moon", "Palm", "Oasis", "Desert", "Horizon",
+                  "Vision", "Summit", "Bridge", "Tower", "Harbor", "Crescent"]
+        mid = ["Trading", "Contracting", "Engineering", "Printing",
+               "Transport", "Services", "Technology", "Medical", "Catering",
+               "Cleaning", "Security", "Steel", "Electrical", "Mechanical",
+               "Furniture", "Consulting", "Logistics", "Marine", "Food",
+               "Travel"]
+        tail = ["WLL", "Co", "Company", "Est", "LLC", "Group", ""]
+        from monaqasat.normalize import normalize_name
+        seen, names = set(), []
+        while len(names) < 6060:
+            nm = (f"{rnd.choice(first)} {rnd.choice(second)} "
+                  f"{rnd.choice(mid)} {rnd.choice(tail)}").strip()
+            if normalize_name(nm) not in seen:
+                seen.add(normalize_name(nm))
+                names.append(nm)
+        site = [_site_row(f"T{i}", nm, str(10000 + i))
+                for i, nm in enumerate(names[:6000])]
+        custs = [_cust(f"C{i}", nm) for i, nm in enumerate(names[6000:])]
+        import time
+        t0 = time.time()
+        m = match_customers(custs, site)
+        elapsed = time.time() - t0
+        wrongly = {x["customer_id"] for x in m}
+        self.assertLessEqual(len(m), 5, m[:5])
+        self.assertLessEqual(len(wrongly), 5)
+        self.assertLess(elapsed, 10.0, "matching must not be quadratic")
+
+
+class TrueMatchesStillWork(unittest.TestCase):
+    def test_spelling_variants(self):
+        m = match_customers([_cust("C1", "Najm Al Farid Trading Co")],
+                            [_site_row("T1", "NAJM ALFARID TRADING", "29309/1")])
+        self.assertEqual([x["method"] for x in m], ["name_fuzzy"])
+        self.assertGreaterEqual(m[0]["score"], 0.92)
+
+    def test_arabic_script_on_the_site_matches_arabic_customer(self):
+        # WOQOD appears in Arabic on the English site (tender 3217/2022)
+        m = match_customers([_cust("C1", "قطر للوقود")], SITE)
+        self.assertEqual([(x["matched_name"], x["method"]) for x in m],
+                         [("قطر للوقود (وقود)", "name_exact")])
+
+    def test_letter_by_letter_transliteration(self):
+        m = match_customers(
+            [_cust("C1", "", name_ar="كيروي للمقاولات والنقليات والخدمات")],
+            SITE)
+        self.assertEqual(
+            [(x["matched_name"], x["method"]) for x in m],
+            [("Kyrwy Llmqawlat Walnqlyat Walkhdmlt", "name_translit")])
+
+    def test_cr_is_preferred_to_a_name_match_on_the_same_row(self):
+        m = match_customers([_cust("C1", "QATAR PRESS", cr="30163")], SITE)
+        self.assertEqual([(x["matched_name"], x["method"]) for x in m],
+                         [("QATAR PRESS", "cr")])
+
+    def test_cr_in_excel_formats(self):
+        for cr in ("30,163", "CR-30163", "030163", "٣٠١٦٣", 30163.0):
+            m = match_customers([_cust("C1", "x", cr=cr)], SITE)
+            self.assertEqual([x["matched_name"] for x in m], ["QATAR PRESS"],
+                             cr)
+
+    def test_thousands_separator_is_not_a_short_cr(self):
+        # "29,309" used to become CR 29 -- a different company
+        site = [_site_row("T1", "SMALL CO", "29"),
+                _site_row("T2", "NAJM ALFARID TRADING", "29309/1")]
+        m = match_customers([_cust("C1", "x", cr="29,309")], site)
+        self.assertEqual([x["matched_name"] for x in m],
+                         ["NAJM ALFARID TRADING"])
+
+
+class Classified(unittest.TestCase):
+    def test_register_match_uses_the_same_rules(self):
+        from monaqasat.match import match_classified
+        reg = [{"profile_number": "CP-1", "name": "QATAR NAVIGATION",
+                "cr_number": "11", "cr_root": "11"},
+               {"profile_number": "CP-2", "name": "GULF DRILLING",
+                "cr_number": "14", "cr_root": "14"}]
+        hits = match_classified([_cust("C1", "Qatar Packaging"),
+                                 _cust("C2", "x", cr="14")], reg)
+        self.assertEqual([(h["customer_id"], h["profile_number"], h["method"])
+                          for h in hits], [("C2", "CP-2", "cr")])
 
 
 if __name__ == "__main__":
