@@ -21,6 +21,9 @@ source gives you.
 
 Standalone. Runs on a laptop. No API key, no bank infrastructure.
 
+**What changed on 22 Sept 2026, and why:** [FIXES.md](FIXES.md) -- each
+problem, how it was reproduced, the fix, and the test that guards it.
+
 ---
 
 ## Why a local harvest rather than a lookup per customer
@@ -169,12 +172,28 @@ Arabic-locale machine, Windows-1252 otherwise -- which is where a
 catches the opposite case -- a UTF-8 file with a few stray bytes pasted in --
 and keeps the Arabic intact instead of mangling every name to fix one byte.
 
-The CR number is what makes matching reliable. Supply it wherever you have it.
+The CR number is what makes matching reliable. Supply it wherever you have
+it. It is read in any format it turns up in -- `29309/1`, `CR-29309`,
+`029309`, `29,309` (Excel's thousands separator), `29309.0`, Arabic-Indic
+digits -- and the load report shows how many customers have one.
 
-Arabic names are transliterated automatically. If the customer list has
-`name_ar` (or the name column itself is Arabic) it is converted to Latin and
-compared to Monaqasat's English names — CR first, then exact key, then fuzzy,
-including machine transliterations such as "Kyrwy Llmqawlat". No extra step.
+Every match records how it was made:
+
+| Method | Means | Use as is? |
+|---|---|---|
+| `cr` | same commercial registration number | yes |
+| `name_exact` | same normalised name, same script (1.0), or same words in another order (0.99) | yes, mostly |
+| `name_fuzzy` | similar name, same script (token-sort >= 0.92) | review |
+| `name_translit` | an Arabic name against a Latin one, as consonant skeletons of the whole name (>= 0.90) | review |
+
+Names on the site are English ("AL RAYYAN TRADING WLL"), a letter-by-letter
+machine transliteration ("Kyrwy Llmqawlat Walnqlyat Walkhdmlt"), or --
+sometimes, even on the English pages -- Arabic ("قطر للوقود (وقود)"). An
+Arabic customer name is compared with all three: exactly against Arabic site
+names, and by transliteration against the others. A customer with only an
+Arabic name and no CR can therefore be matched, but only by
+`name_translit`, which needs a look. `--fuzzy 1` and `--translit 1` switch
+the similar-name methods off.
 
 ## Harvest without keeping the laptop open
 
@@ -189,9 +208,10 @@ python -m monaqasat status
 ```
 
 Register a nightly task that wakes the machine and keeps going until
-`status` shows every section complete. After that, the same task is a cheap
-incremental update: new tenders, and any tender that moved (open last month,
-awarded this month) is refetched and the stored status is updated in place.
+`status` shows every section complete. After that, the same task keeps the
+store current: new tenders, and every tender that moved section (open last
+month, closed this week, awarded today) -- see "What an update run does"
+below for how that is guaranteed rather than hoped for.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-task.ps1
@@ -211,9 +231,10 @@ fetches what is new or has changed.
 
 ```powershell
 python -m monaqasat harvest --max-hours 6          # everything, then incremental
-python -m monaqasat crawl --kind companies         # the six sections that name companies
-python -m monaqasat companies                      # new classified companies
+python -m monaqasat crawl --kind all               # every tender and bid section
+python -m monaqasat companies                      # the classified register
 python -m monaqasat status                         # what's done, what's pending
+python -m monaqasat history --tender 659460        # how one tender moved
 ```
 
 ### Why it tracks tenders, not pages
@@ -232,17 +253,48 @@ holds.
 
 ### What an update run does
 
-1. **Catch up.** Reads the newest listing pages until two in a row contain
-   nothing new, then stops.
-2. **Finish an interrupted first load.** If a previous run never reached the
-   last page, it carries on from where it stopped -- allowing for the drift
-   since then -- rather than starting over.
-3. **Fill gaps.** Any listing page that failed before is re-read, in the
-   neighbourhood it has drifted to since.
-4. **Details.** Fetches detail pages only for tenders that are new, or whose
-   state has moved on. When a tender goes from technically opened to awarded,
-   its companies page is fetched again -- that is where the winners appear --
-   but its description is not, because that does not change.
+How a section is kept current depends on how the site orders it (checked on
+the live site, Sept 2026):
+
+| Section | Order on the site | Each run |
+|---|---|---|
+| Awarded | newest award date first | read from page 1 until two pages hold nothing new **and** the award dates are 14 days older than the newest one held (`--lookback-days`), plus a slice of a rolling full pass |
+| Cancelled | no date order | read from page 1 until caught up, plus a slice of a rolling full pass |
+| everything else | Available and Closed by *publish* date; Technically / Financially Opened in neither | read end to end -- about 275 pages across all of them |
+
+Why: a tender that closes today lands in Closed where its *publish* date
+puts it, which can be page 4, not page 1. Reading from the top until nothing
+new would never get there, and the tender would stay "open" in the store
+indefinitely. Reading the small sections end to end finds it wherever it
+lands, and is also what lets a run notice that a tender has **left** a
+section. The rolling pass (`--roll-pages` per run, restarting every
+`--sweep-days`) re-reads Awarded and Cancelled end to end over a week or so,
+so an award published with an old date, or a cancellation on page 8, is
+found even though no single run reads 1,400 pages.
+
+Then, after every listing has been read:
+
+1. **State.** A tender's state is the most advanced section it is listed in
+   *now*. The site lists a tender in several sections at once -- every
+   Financially Opened tender is also under Technically Opened -- so the
+   furthest one wins. Nothing is deleted: when a tender moves from Available
+   to Closed, it keeps its Available record, marked `gone_at` once two full
+   reads in a row no longer list it (two, because a page that shifts during
+   a read can hide a tender once). `history --tender ID` shows the whole
+   path. A closing date extended after closing sends a tender back to
+   Available; once opened, a tender never moves back.
+2. **Detail pages**, most valuable first: companies pages of newly awarded
+   tenders (winners, every bidder, prices), then companies pages of tenders
+   in opening (who is bidding now), then TenderDetails. A companies page is
+   read again only when the tender is awarded -- at financial opening the
+   site still shows the technical list only, so re-reading it then adds
+   nothing. A page that answers with the site's home page is recorded as
+   missing and tried again weekly, three times; it does not stop the run.
+3. **Gaps.** Any listing page that failed is re-read on the next run.
+
+`--quick` skips the full reads and the rolling pass -- fast, but a tender
+that moves into the middle of a list is not noticed until the next normal
+run.
 
 A section counts as complete only once it has been read to the last page
 **and** no page is left failed. A load with a hole in it is not complete.
@@ -259,25 +311,36 @@ not the 2,000 already held. The tests check exactly this case.
 | Flag | Effect |
 |---|---|
 | *(default)* | incremental, as above |
-| `--full` | read every listing page instead of stopping when caught up. Still only fetches details that are missing or stale. Use occasionally to sweep for anything the incremental pass could miss. |
+| `--full` | read every page of every selected section now (including all of Awarded). Still only fetches details that are missing or stale. |
+| `--quick` | only read from the top until caught up, everywhere |
 | `--pages 1-100` | stay within that range |
 | `--limit-details 500` | cap detail requests this run -- spread a large first load over several days |
 | `--stop-after 3` | be more cautious about deciding it has caught up |
-| `--timeout 120` | wait longer for slow pages (default 90 s) |
+| `--lookback-days 14` | how far below the newest award date the Awarded scan keeps reading |
+| `--roll-pages 100` | pages of the rolling pass over Awarded and Cancelled, per run |
+| `--sweep-days 7` | start a new rolling pass this long after the last one finished |
+| `--timeout 120` | wait longer for slow pages (default 120 s) |
 | `--max-hours 6` | stop cleanly; next run continues |
 
 ### The classified register
 
 The register is ordered the other way -- **oldest first**, new companies on
-the last page -- so an update only reads the tail. But existing companies
-change in place: evaluations, certificate expiry, activities. Refresh them
-monthly with `python -m monaqasat companies --full`, which takes about seven
-minutes.
+the last page -- so an update reads the tail for new companies. Existing
+companies change in place (evaluations, certificate expiry, activities) and
+can be removed, so each run also refreshes a slice of the register
+(`--register-pages`, default 20), starting a new refresh pass every
+`--register-days` (30). A company missing from two complete passes in a row
+is marked `delisted_at` -- no longer classified, which matters for a
+borrower that bids for government work. `companies --full` does a whole pass
+in one go.
 
 ### Slow pages
 
-Some pages take over a minute to render, in a browser as well -- register
-page 2 is one. Each request waits up to 90 seconds, twice. A page that still
+Some pages take a long time to render: register page 2 (145 activity rows)
+took 30.8 seconds with a cold cache, just over the original 30-second
+timeout. A browser that shows it in five seconds is usually showing a cached
+copy. Each request now waits up to 120 seconds, on a fresh connection for
+the second try. A page that still
 does not answer is **skipped and recorded**, the run carries on, and the next
 run retries it. Five failures in a row stops the run: that pattern means the
 site is struggling or refusing, and pressing on would make it worse.
@@ -316,14 +379,19 @@ One SQLite file.
 
 | Table | Holds |
 |---|---|
-| `raw_page` | Every page's HTML exactly as fetched, with its timestamp |
+| `raw_page` | Every page's HTML exactly as fetched, with its timestamp and a content hash that ignores the site's tracking script |
 | `tender` | Number, subject, ministry, family and state, all four dates, bond, document value, awarded amount, brief description, ICV requirement, contract duration, delivery location and the rest of the terms |
 | `tender_activity` | The activity codes each tender requires |
 | `company` | Per tender: winners and bidders, with name, CR number, value, financial result |
 | `classified_company` | The register: profile number, type, CR, **size**, **government evaluation**, classification and its **expiry date** |
 | `company_activity` | Each classified company's activity codes and **classification grade** |
-| `crawl_state` | Crawl position per section, for resume |
+| `sighting` | Every section each tender has been listed in: first and last seen, and when it left (`gone_at`) |
+| `detail_fetch` | Which detail pages were read, at which state |
+| `section_state` | Per section: first load, last full read, rolling pass position |
+| `failed_page` | Pages waiting to be retried, and pages the site answers with its home page |
+| `crawl_state` | Register pages read, for resume |
 | `match` | Your customers joined to company rows, with method and score |
+| `feature_cr_month` | CR-by-month features for modelling (`features`) |
 
 **The raw HTML is kept on purpose.** Parsers get things wrong and sites change.
 With the pages on disk you re-parse in seconds (`python -m monaqasat parse`)
@@ -366,15 +434,20 @@ monaqasat/
                 classified register -> rows
   store.py      SQLite: raw HTML, tenders, companies, sightings, fetch log,
                 failed pages, section progress, run history, matches
-  match.py      CR number -> exact name -> fuzzy name, in that order;
-                Arabic customer names are transliterated automatically
-  normalize.py  Qatari entity-name normalisation + Arabic → Latin
+  match.py      CR -> exact name -> similar name -> transliteration, each
+                match labelled with its method and score
+  normalize.py  Qatari entity-name normalisation, Arabic-script folding,
+                Arabic <-> Latin skeletons, CR numbers
+  features.py   CR-by-month feature table
   cli.py        doctor | probe | harvest | crawl | companies | status |
-                parse | match | analyse | stats | export | profile
+                history | parse | match | analyse | features | stats |
+                export | profile
   scripts/      harvest.ps1 and install-task.ps1 (unattended nightly run)
 fixtures/       real markup captured from the live site, Sept 2026
-tests/          offline tests -- including a simulated site that publishes
-                tenders between runs, and Arabic name matching
+tests/          offline tests -- a simulated site that publishes, moves and
+                cancels tenders between runs (test_incremental,
+                test_lifecycle), the register (test_register), upgrades of
+                older databases (test_migration), matching (test_match)
 ```
 
 ```bash
@@ -401,16 +474,18 @@ their HTML shows up as a test failure rather than as silently empty columns.
   a government job does not appear. Absence of awards is not absence of
   government work.
 - **Names are transliterated inconsistently.** "Kyrwy Llmqawlat Walnqlyat
-  Walkhdmlt" is a machine transliteration of an Arabic name. Matching
-  transliterates Arabic customer names (and a `name_ar` column) and also
-  falls back to a consonant skeleton, so CR is still best but names join
-  without a manual mapping file.
+  Walkhdmlt" is a machine transliteration of an Arabic name, and some names
+  appear in Arabic even on the English pages. Name matching handles all of
+  it, but a name is not an identifier: two companies can share one. Use the
+  CR; treat `name_fuzzy` and `name_translit` matches as leads to check.
 - **No deduplication across branches.** CR numbers carry a branch suffix
   (`29309/1`); matching uses the root, so branches collapse onto the parent.
   Check that against your own CR conventions.
 - **The bid-versus-win rate needs the opened sections.** `analyse` only sees
   what you crawled: without `technical` and `financial`, every company looks
-  like it wins everything it enters.
+  like it wins everything it enters. The rate is wins over *decided*
+  tenders; bids still being evaluated are shown as open, not counted as
+  losses.
 - **Government evaluation is not explained anywhere public.** "Excellent",
   "Very Good", "Good" are the Ministry's own grades with no published
   methodology. Treat them as a reported fact, not a validated score.
