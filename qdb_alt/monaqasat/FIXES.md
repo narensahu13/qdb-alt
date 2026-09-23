@@ -384,9 +384,8 @@ gets `delisted_at`.
 - **Matching on the secondary number** (the value after `|` in
   `29309/1 | 10497`) was not added. Both numbers are in the same numeric
   range, so one company's secondary number often equals another's CR.
-- **Compressing stored HTML** was not done. A full load is about 2 GB of
-  HTML, and zlib would cut that roughly tenfold. This is a reasonable next
-  step; it needs a decode helper wherever `raw_page.html` is read.
+- **Compressing stored HTML** was not done here. It was done the next day;
+  see the follow-up at the end of this file.
 - **Fuzzy matches are never treated as confirmed.** `profile` marks them with
   `*`, and `match` prints how many need review.
 
@@ -394,9 +393,149 @@ gets `delisted_at`.
 
 ```powershell
 cd qdb_alt\monaqasat
-python -m unittest discover -s tests -t .      # 219 tests, offline
+python -m unittest discover -s tests -t .      # 240 tests, offline
 python -m monaqasat crawl --kind all --max-hours 1
 python -m monaqasat status                    # listed / left / last full read / rolling pass
 python -m monaqasat history --tender 659460
 python -m monaqasat match --customers book.xlsx --out matches.csv
 ```
+
+---
+
+# Follow-up, 23 September 2026 (v0.5.0)
+
+Three changes, after rehearsing the question they came from: *next month I
+run it again -- does it only fetch what changed, does it notice the bids
+that closed, and can the database stop growing like this?*
+
+The rehearsal is the evidence for the first one, so it comes first.
+
+## The rehearsal
+
+The real database as it stood on 22 Sept (25,300 tenders, 4,781 classified
+companies) against a simulated site holding those tenders plus the sections
+never crawled yet, at the page counts the live site has. The actual crawl
+code runs against it; the only thing faked is the HTTP. Requests are counted
+and converted at the 1.5 s delay.
+
+| Run | Listing pages | Companies pages | TenderDetails | Total | At 1.5 s |
+|---|---|---|---|---|---|
+| Catch-up: first run of the fixed code | 764 | 25,000 | 11,941 | 37,705 | ~16 h |
+| A month later | 1,490 | 444 | 496 | 2,430 | ~61 min |
+| The next night, nothing changed | 312 | 0 | 0 | 312 | ~8 min |
+| A month after that | 1,766 | 444 | 496 | 2,706 | ~68 min |
+
+The catch-up run is large because the September crawl fetched no companies
+pages at all for the 24,200 awarded tenders (that was fix 4: TenderDetails
+ran first and used the whole budget), and because Available, Closed,
+Cancelled, Future and the seven Bids sections have never been read. It is a
+one-off; every run after it costs about an hour a month, or minutes a night.
+
+What the update run was checked to do, in the same rehearsal:
+
+- open bids from last month that were decided now read as awarded, their
+  companies page re-read exactly once, award rows stored
+- tenders that closed found in Closed at page 4, where their publish date
+  puts them
+- tenders that reached financial opening moved on, with no wasted re-fetch
+- an award published this month but dated 40 days back: found
+- five cancellations dropped on page 100 of Cancelled: found
+- detail pages fetched only for what changed (444 companies pages for 418
+  newly awarded tenders)
+- nothing deleted, and the second month costs the same as the first
+
+## 11. The rolling pass now fits how often you run it
+
+**What happened.** `--roll-pages` was a fixed 100 pages per run. That suits a
+nightly task: Awarded (1,210 pages) is swept every fortnight. Run the same
+command once a month and the pass advances 100 pages a *month* -- a full
+sweep of Awarded takes a year, so a cancellation deep in the list or an award
+published with an old date can sit unnoticed for months. Nothing was wrong
+with the code; the default assumed a frequency.
+
+**Shown by.** The same monthly run, capped the old way at 100 pages, costs
+1,433 requests (~36 min) and leaves the Awarded pass at **page 102 of
+1,273** -- twelve more monthly runs, a year, before the section has been
+swept once, and Cancelled at page 102 of 226. Sized from the gap instead,
+the run costs 2,430 requests (~61 min) and both passes finish inside it. An
+hour a month, and nothing waits a year.
+
+**Fix.** The slice is sized from the gap since that command last ran:
+`pages x (days since last run) / --sweep-days`, never fewer than 100 pages.
+Nightly runs take a seventh of the section each night; a run a month later
+sweeps the whole section in that run. `--roll-pages` now *caps* a run for
+anyone who wants a hard ceiling. The register refresh is sized the same way
+against `--register-days`, so a monthly run refreshes all 245 pages (about
+six minutes) instead of 20.
+
+**Tests.** `test_lifecycle.RunFrequency`, `test_register.RegisterFrequency`.
+
+## 12. The database is about a tenth of the size
+
+**What happened.** The September crawl left a 1 GB file, and it was only
+part way through: every page is stored as HTML, and a full load is a few GB.
+Nearly all of that is the same navigation, scripts and styles repeated on
+every page.
+
+**Fix** (`store.py`, schema v3). Pages are compressed as they are stored.
+One page of each kind is kept in the new `blob_dict` table and used as a
+zlib preset dictionary for the rest, which is what makes the repeated
+chrome nearly free. Nothing is lost: `html_of(row)` returns the page exactly
+as fetched, and `parse` re-parses from it as before.
+
+**Measured** on the pages captured from the live site in `fixtures/`:
+
+| | Raw | Stored | |
+|---|---|---|---|
+| A detail page | 24.3 KB | 0.4 KB | 57x |
+| Another detail page | 29.8 KB | 0.9 KB | 35x |
+| A home-page answer | 43.8 KB | 5.9 KB | 7x |
+| A listing page | 5.8 KB | 0.8 KB | 7x |
+| All eight fixtures | 137.4 KB | 10.7 KB | 13x |
+
+Detail pages compress hardest because they are the ones that share their
+layout with the sample. Expect something around ten times on the real
+database; `compact` prints what it actually achieved.
+
+**For a database written before this**, nothing happens on open -- a 1 GB
+file would take minutes to rewrite, and that is not something an ordinary
+`status` should do. The work is a command:
+
+```powershell
+python -m monaqasat compact        # compress what is stored, then VACUUM
+```
+
+`--no-vacuum` skips reclaiming the space (VACUUM needs room for a second
+copy of the file while it runs). `--drop-before DATE` additionally drops the
+stored copy of older pages, keeping their parsed rows and content hashes;
+you rarely want it, since compression already makes the file small.
+
+**Tests.** `test_storage`: round-trip including Arabic, pages written before
+v3 still readable, `compact` keeping every page byte for byte, re-parsing
+after compacting, and a packed copy's contents.
+
+## 13. A packed copy no longer carries your customers
+
+**What happened.** `pack` (added 22 Sept, to move a database between
+machines) copied every table except `raw_page` -- including `match`, which
+holds customer ids, customer names and the CR they matched on. The packed
+file in `data/monaqasat.slim.db` happens to be clean because `match` was
+empty when it was made, but the next `pack` after a `match --customers` run
+would have put the bank's book into a public repository.
+
+**Fix.** `pack` leaves out `raw_page`, `blob_dict` and `match`, and says so
+when it runs.
+
+**Tests.** `test_storage.PackedCopy` fails if a customer id or name appears
+anywhere in the packed file.
+
+## Still not done
+
+- **Trimming pages before storing them** (dropping scripts and styles) would
+  save another two to three times on top of compression, but the stored page
+  would no longer be the page as served. Compression gets most of the way
+  there and keeps the evidence intact.
+- **A second sample** when the site's layout changes: pages already stored
+  keep the sample they were written against (that is why `blob_dict` rows
+  are never deleted), and new pages would compress a little worse until one
+  is added. Not worth the machinery today.

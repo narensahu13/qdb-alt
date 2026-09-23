@@ -267,10 +267,16 @@ puts it, which can be page 4, not page 1. Reading from the top until nothing
 new would never get there, and the tender would stay "open" in the store
 indefinitely. Reading the small sections end to end finds it wherever it
 lands, and is also what lets a run notice that a tender has **left** a
-section. The rolling pass (`--roll-pages` per run, restarting every
-`--sweep-days`) re-reads Awarded and Cancelled end to end over a week or so,
-so an award published with an old date, or a cancellation on page 8, is
-found even though no single run reads 1,400 pages.
+section. The rolling pass re-reads Awarded and Cancelled end to end, so an
+award published with an old date, or a cancellation on page 100, is found
+even though no single run reads 1,400 pages.
+
+**How much of that pass a run does depends on how long it has been since the
+last one.** Run this nightly and each night takes a slice, finishing the
+pass within `--sweep-days`. Run it once a month and that one run sweeps the
+whole section, because there is no next night to carry it. You do not have
+to configure anything for that; `--roll-pages` is there to cap a single run
+if you want to.
 
 Then, after every listing has been read:
 
@@ -317,7 +323,7 @@ not the 2,000 already held. The tests check exactly this case.
 | `--limit-details 500` | cap detail requests this run -- spread a large first load over several days |
 | `--stop-after 3` | be more cautious about deciding it has caught up |
 | `--lookback-days 14` | how far below the newest award date the Awarded scan keeps reading |
-| `--roll-pages 100` | pages of the rolling pass over Awarded and Cancelled, per run |
+| `--roll-pages 100` | cap the rolling pass at this many pages per run. Unset, the slice is sized from the gap since the last run, so the pass finishes within `--sweep-days` whether you run nightly or monthly |
 | `--sweep-days 7` | start a new rolling pass this long after the last one finished |
 | `--timeout 120` | wait longer for slow pages (default 120 s) |
 | `--max-hours 6` | stop cleanly; next run continues |
@@ -327,9 +333,11 @@ not the 2,000 already held. The tests check exactly this case.
 The register is ordered the other way -- **oldest first**, new companies on
 the last page -- so an update reads the tail for new companies. Existing
 companies change in place (evaluations, certificate expiry, activities) and
-can be removed, so each run also refreshes a slice of the register
-(`--register-pages`, default 20), starting a new refresh pass every
-`--register-days` (30). A company missing from two complete passes in a row
+can be removed, so each run also refreshes a slice of the register, sized
+the same way as the rolling pass above (`--register-pages` caps it), and
+starts a new refresh pass every `--register-days` (30). A run a month later
+refreshes all 245 pages itself, about six minutes. A company missing from
+two complete passes in a row
 is marked `delisted_at` -- no longer classified, which matters for a
 borrower that bids for government work. `companies --full` does a whole pass
 in one go.
@@ -379,7 +387,8 @@ One SQLite file.
 
 | Table | Holds |
 |---|---|
-| `raw_page` | Every page's HTML exactly as fetched, with its timestamp and a content hash that ignores the site's tracking script |
+| `raw_page` | Every page as fetched, compressed, with its timestamp and a content hash that ignores the site's tracking script |
+| `blob_dict` | One sample page per kind, used to compress the others (see below) |
 | `tender` | Number, subject, ministry, family and state, all four dates, bond, document value, awarded amount, brief description, ICV requirement, contract duration, delivery location and the rest of the terms |
 | `tender_activity` | The activity codes each tender requires |
 | `company` | Per tender: winners and bidders, with name, CR number, value, financial result |
@@ -398,6 +407,34 @@ With the pages on disk you re-parse in seconds (`python -m monaqasat parse`)
 instead of re-crawling 24,000 pages. It also means the fetch date of every
 field is provable, which is what lets this be used as evidence in a credit
 file rather than as an unsourced number.
+
+### Keeping the file small
+
+The pages are nearly all of the file, and every page on this site carries the
+same navigation, scripts and styles. So one page of each kind is kept in
+`blob_dict` as a sample, and the rest are compressed against it: measured on
+the captured pages, a detail page stores about ten times smaller than its
+HTML, and the whole set 13 times. Nothing is thrown away -- what comes back
+out is the page exactly as fetched, and `parse` works as before.
+
+Pages are compressed as they arrive. A database written before v0.5 keeps
+its pages as they are until you run:
+
+```powershell
+python -m monaqasat compact          # compress what is stored, then VACUUM
+```
+
+It prints what it did and what the file went from and to. Two things worth
+knowing: `VACUUM` needs room for a second copy of the file while it runs
+(`--no-vacuum` skips it), and `--drop-before 2025-01-01` will also drop the
+stored copy of older pages -- their parsed rows and content hashes stay, but
+they can no longer be re-parsed without re-crawling. You rarely want that:
+compression already makes the file small.
+
+To move the data between machines, `python -m monaqasat pack` writes a copy
+with no stored pages at all (about 20 MB, small enough for git). It leaves
+out `raw_page`, `blob_dict` and `match` -- the last of those holds your
+customers' ids and names, so a packed copy carries nothing of the bank's.
 
 ---
 
@@ -441,7 +478,7 @@ monaqasat/
   features.py   CR-by-month feature table
   cli.py        doctor | probe | harvest | crawl | companies | status |
                 history | parse | match | analyse | features | stats |
-                export | profile
+                export | profile | pack | compact
   scripts/      harvest.ps1 and install-task.ps1 (unattended nightly run)
 fixtures/       real markup captured from the live site, Sept 2026
 tests/          offline tests -- a simulated site that publishes, moves and
