@@ -285,6 +285,70 @@ class DetailPages(Harness):
         s.close()
 
 
+class RunFrequency(Harness):
+    """The rolling pass has to fit how often the tool is run. Nightly runs
+    take a slice a night; a run a month later has to cover the section
+    itself, or a cancellation deep in the list waits a year."""
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date, timedelta
+        self.site.publish(AWARD, 3000)                     # 150 pages
+        today = date.today()
+        for i, t in enumerate(self.site.sections[AWARD]):  # newest first
+            self.site.dates[t] = (today - timedelta(days=i)).strftime("%d/%m/%Y")
+        self.crawl(listings_only=True)
+        # an award published now, dated five months back: far down the list
+        self.t = self.site.publish("Staging", 1)[0]
+        self.site.dates[self.t] = (today - timedelta(days=150)).strftime(
+            "%d/%m/%Y")
+        self.site.sections[AWARD].insert(1500, self.t)     # page 76
+
+    def _age(self, days: int) -> None:
+        """Make the stored runs look `days` older, so the next crawl is one
+        that happens that long afterwards."""
+        s = self.store()
+        s.conn.execute("UPDATE run SET started_at = datetime(started_at, ?)",
+                       (f"-{days} days",))
+        s.conn.execute("UPDATE section_state SET last_full_pass ="
+                       " datetime(last_full_pass, ?)", (f"-{days} days",))
+        s.conn.commit()
+        s.close()
+
+    def test_a_run_a_month_later_sweeps_the_whole_section(self):
+        self._age(30)
+        self.crawl(listings_only=True, roll_pages=None)
+        s = self.store()
+        self.assertEqual(s.current_state(self.t), "awarded")
+        self.assertIsNone(s.section("awarded")["roll_next"],
+                          "a monthly run has to finish the pass itself")
+        s.close()
+
+    def test_nightly_runs_take_slices_and_still_get_there(self):
+        most = 0
+        for night in range(1, 15):
+            self._age(1)
+            self.crawl(listings_only=True, roll_pages=None)
+            most = max(most, self.site.count("AwardedTenders/"))
+            if self.store_state() == "awarded":
+                break
+        self.assertEqual(self.store_state(), "awarded",
+                         "found within a fortnight of nightly runs")
+        self.assertLessEqual(most, 110, "no single night reads the section")
+
+    def test_an_explicit_cap_still_wins(self):
+        self._age(30)
+        self.crawl(listings_only=True, roll_pages=5)
+        self.assertLess(self.site.count("AwardedTenders/"), 20)
+
+    def store_state(self):
+        s = self.store()
+        try:
+            return s.current_state(self.t)
+        finally:
+            s.close()
+
+
 class GoneMarking(Harness):
     def test_reappearing_clears_the_mark(self):
         ids = self.site.publish(TECH, 5)

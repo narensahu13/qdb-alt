@@ -130,5 +130,61 @@ class RegisterPasses(unittest.TestCase):
         self.assertEqual(self.delisted(), [])
 
 
+class RegisterFrequency(unittest.TestCase):
+    """The refresh pass has to fit how often `companies` is run: a slice a
+    night, or the whole register when the run comes a month later."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "r.db")
+        self.reg = FakeRegister(1000)                    # 50 pages
+        reg = self.reg
+        for p in (mock.patch.object(Fetcher, "check_robots", lambda s: ""),
+                  mock.patch.object(Fetcher, "get", lambda s, rel: reg.get(rel)),
+                  mock.patch("builtins.print")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.run_()                                      # first load
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_(self, **kw):
+        self.reg.requests.clear()
+        a = dict(db=self.db, pages=None, full=False, delay=0, timeout=5,
+                 register_pages=None, register_days=30)
+        a.update(kw)
+        return cli.cmd_companies(Namespace(**a))
+
+    def _age(self, days: int) -> None:
+        s = Store(self.db)
+        s.conn.execute("UPDATE run SET started_at = datetime(started_at, ?)",
+                       (f"-{days} days",))
+        s.conn.execute("UPDATE section_state SET last_full_pass ="
+                       " datetime(last_full_pass, ?)", (f"-{days} days",))
+        s.conn.commit()
+        s.close()
+
+    def test_a_run_a_month_later_refreshes_every_page(self):
+        self._age(30)
+        self.run_()
+        pages = {int(r.rsplit("/", 1)[1]) for r in self.reg.requests}
+        self.assertGreaterEqual(len(pages), 50)
+        s = Store(self.db)
+        sec = s.section("classified")
+        s.close()
+        self.assertIsNone(sec["roll_next"], "the pass finished in this run")
+
+    def test_a_run_the_next_day_only_reads_the_tail(self):
+        self._age(1)
+        self.run_()
+        self.assertLessEqual(len(self.reg.requests), 5)
+
+    def test_an_explicit_cap_still_wins(self):
+        self._age(30)
+        self.run_(register_pages=5)
+        self.assertLessEqual(len(self.reg.requests), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

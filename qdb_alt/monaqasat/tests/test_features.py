@@ -32,9 +32,10 @@ class RawPageDedup(unittest.TestCase):
                 store.save_page(url, "listing", "<p>one</p><script>x</script>"),
                 "unchanged")
             self.assertEqual(store.save_page(url, "listing", "<p>two</p>"), "changed")
-            html = store.conn.execute(
-                "SELECT html FROM raw_page WHERE url=?", (url,)).fetchone()[0]
-            self.assertEqual(html, "<p>two</p>")
+            row = store.conn.execute(
+                "SELECT * FROM raw_page WHERE url=?", (url,)).fetchone()
+            # stored compressed since v3; what comes back is the page itself
+            self.assertEqual(store.html_of(row), "<p>two</p>")
             store.close()
 
 
