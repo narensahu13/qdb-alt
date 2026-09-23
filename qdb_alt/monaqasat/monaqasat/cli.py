@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import sqlite3
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -143,9 +145,12 @@ def cmd_probe(args) -> int:
 #                so every run reads them end to end. That full read is also
 #                what lets a run notice that a tender has LEFT a section.
 #
-# The rolling pass re-reads Awarded and Cancelled end to end over several
-# runs (--roll-pages per run), starting again every --sweep-days, so nothing
-# a head scan misses stays missed.
+# The rolling pass re-reads Awarded and Cancelled end to end, so nothing a
+# head scan misses stays missed. How much of it a run does is sized from how
+# long it has been since the last run: the pass should finish within
+# --sweep-days whether the tool runs nightly (a slice a night) or once a
+# month (the whole section in that one run). --roll-pages fixes the slice
+# instead, for anyone who wants to cap what a single run costs.
 #
 # Listing pages are cheap -- one request covers twenty tenders. Detail pages
 # are the cost. They are fetched after every listing has been read, so each
@@ -179,6 +184,25 @@ def _set_deadline(args) -> None:
 def _opt(args, name, default):
     value = getattr(args, name, None)
     return default if value is None else value
+
+
+def _slice_pages(store, args, last: int, *, flag: str, period: str,
+                 period_default: float, floor: int, command: str,
+                 run_id: int | None = None) -> int:
+    """How many pages of a rolling pass to read this run.
+
+    Enough that the pass finishes within its period at the frequency the
+    tool is actually being run: a nightly run takes a seventh of the
+    section, a run a month later takes all of it. An explicit --roll-pages
+    or --register-pages overrides this and caps the run instead.
+    """
+    explicit = getattr(args, flag, None)
+    if explicit:
+        return int(explicit)
+    days = _opt(args, period, period_default) or period_default
+    gap = max(store.days_since_last_run(command, run_id), 1.0)
+    share = 1.0 if days <= 0 else min(1.0, gap / days)
+    return max(floor, math.ceil(last * share))
 
 
 def _policy(kind: str, args) -> str:
@@ -424,7 +448,11 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
             # pages of new awards arrived since; one page of overlap covers
             # the rounding.
             start = 2 if nxt is None else max(2, nxt + shift - 1)
-            end = min(last, start + _opt(args, "roll_pages", ROLL_PAGES) - 1)
+            slice_pages = _slice_pages(
+                store, args, last, flag="roll_pages", period="sweep_days",
+                period_default=SWEEP_DAYS, floor=ROLL_PAGES, command="crawl",
+                run_id=run_id)
+            end = min(last, start + slice_pages - 1)
             for page in range(start, end + 1):
                 if page in visited:
                     continue
@@ -642,7 +670,10 @@ def cmd_companies(args) -> int:
                     if str(r["ref"]).isdigit()})
     pass_id = sec["pass_id"]
     roll_next = sec["roll_next"]
-    budget = _opt(args, "register_pages", REGISTER_PAGES)
+    budget = _slice_pages(
+        store, args, last, flag="register_pages", period="register_days",
+        period_default=REGISTER_DAYS, floor=REGISTER_PAGES,
+        command="companies")
 
     if args.pages:
         pages = [p for p in _pages(args.pages) if 1 <= p <= last]
@@ -866,10 +897,11 @@ def cmd_parse(args) -> int:
     counts = {"listing": 0, "tender_details": 0, "detail": 0, "classified": 0}
 
     for row in list(store.pages("listing")):
-        if not row["html"] or looks_rejected(row["html"]):
+        html = store.html_of(row)
+        if not html or looks_rejected(html):
             continue
         kind = kind_from_url(row["url"])
-        for r in parse_listing(row["html"], kind):
+        for r in parse_listing(html, kind):
             # fields only: the state comes from the sightings, not from
             # whichever old copy of a listing page happens to be on disk
             store.upsert_tender({k: v for k, v in r.items() if k != "state"},
@@ -877,9 +909,10 @@ def cmd_parse(args) -> int:
         counts["listing"] += 1
 
     for row in list(store.pages("tender_details")):
-        if not row["html"] or looks_rejected(row["html"]):
+        html = store.html_of(row)
+        if not html or looks_rejected(html):
             continue
-        parsed = parse_tender_details(row["html"], row["tender_id"])
+        parsed = parse_tender_details(html, row["tender_id"])
         if not parsed.get("found"):
             continue
         store.upsert_tender(parsed["tender"], source_url=row["url"])
@@ -887,9 +920,10 @@ def cmd_parse(args) -> int:
         counts["tender_details"] += 1
 
     for row in list(store.pages("detail")):
-        if not row["html"] or looks_rejected(row["html"]):
+        html = store.html_of(row)
+        if not html or looks_rejected(html):
             continue
-        parsed = parse_detail(row["html"], row["tender_id"])
+        parsed = parse_detail(html, row["tender_id"])
         if not parsed.get("found"):
             continue
         store.upsert_tender(parsed["tender"], source_url=row["url"])
@@ -897,9 +931,10 @@ def cmd_parse(args) -> int:
         counts["detail"] += 1
 
     for row in list(store.pages("classified")):
-        if not row["html"] or looks_rejected(row["html"]):
+        html = store.html_of(row)
+        if not html or looks_rejected(html):
             continue
-        for r in parse_company_list(row["html"]):
+        for r in parse_company_list(html):
             store.upsert_company(r, page=row["page"])
         counts["classified"] += 1
 
@@ -1057,7 +1092,7 @@ def cmd_stats(args) -> int:
 
 def cmd_pack(args) -> int:
     """Write a copy with no stored HTML, small enough to put in git."""
-    from .store import pack_database
+    from .store import PACK_SKIP, pack_database
     src = Path(args.db)
     if not src.exists():
         print(f"no database at {src}", file=sys.stderr)
@@ -1068,6 +1103,57 @@ def cmd_pack(args) -> int:
     print(f"wrote {args.out}")
     print("HTML is not in this file. On the other laptop, copy it to")
     print("monaqasat.db and keep harvesting; crawl progress is included.")
+    print("Left out: " + ", ".join(PACK_SKIP)
+          + " -- match holds your customers' ids and names, so a packed copy"
+          " is safe to share.")
+    return 0
+
+
+def cmd_compact(args) -> int:
+    """Shrink the database: compress stored pages, then reclaim the space.
+
+    Pages are compressed as they are fetched from v0.5 on. This command is
+    for a database written before that, and for reclaiming the file space
+    afterwards. Nothing parsed is touched, and every page still reads back
+    exactly as it was fetched.
+    """
+    path = Path(args.db)
+    if not path.exists():
+        print(f"no database at {path}", file=sys.stderr)
+        return 1
+    before = path.stat().st_size
+    store = Store(args.db)
+    by_kind = store.stored_bytes()
+    if by_kind:
+        print("stored pages, before:")
+        for kind, n in by_kind.items():
+            print(f"  {kind:16} {(n or 0)/1e6:8.1f} MB")
+
+    def tick(done: int) -> None:
+        print(f"  compressed {done}...", flush=True)
+
+    result = store.compact(progress=tick if not args.quiet else None,
+                           drop_before=args.drop_before)
+    if result["compressed"]:
+        print(f"compressed {result['compressed']} pages: "
+              f"{result['bytes before']/1e6:.0f} MB of HTML -> "
+              f"{result['bytes after']/1e6:.1f} MB stored "
+              f"({result['bytes before'] / max(result['bytes after'], 1):.1f}x)")
+    else:
+        print("every page was already compressed")
+    if result["dropped"]:
+        print(f"dropped the stored copy of {result['dropped']} page(s) "
+              f"fetched before {args.drop_before}; their parsed rows and "
+              "content hashes stay")
+    store.close()
+    if not args.no_vacuum:
+        print("reclaiming file space (VACUUM)...", flush=True)
+        conn = sqlite3.connect(args.db, isolation_level=None)
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+    after = path.stat().st_size
+    print(f"database {before/1e6:.0f} MB -> {after/1e6:.1f} MB")
     return 0
 
 
@@ -1114,7 +1200,7 @@ def cmd_harvest(args) -> int:
         full=bool(getattr(args, "full_register", False)),
         delay=args.delay, timeout=args.timeout,
         max_hours=None, deadline=deadline,
-        register_pages=_opt(args, "register_pages", REGISTER_PAGES),
+        register_pages=getattr(args, "register_pages", None),
         register_days=_opt(args, "register_days", REGISTER_DAYS),
     ))
     if _expired(args):
@@ -1129,7 +1215,7 @@ def cmd_harvest(args) -> int:
         timeout=args.timeout, listings_only=False,
         no_details=args.no_details, max_hours=None, deadline=deadline,
         lookback_days=_opt(args, "lookback_days", LOOKBACK_DAYS),
-        roll_pages=_opt(args, "roll_pages", ROLL_PAGES),
+        roll_pages=getattr(args, "roll_pages", None),
         sweep_days=_opt(args, "sweep_days", SWEEP_DAYS),
     ))
 
@@ -1262,9 +1348,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Awarded head scan: keep reading until award "
                              "dates are this many days older than the newest "
                              f"already held (default {LOOKBACK_DAYS})")
-        sp.add_argument("--roll-pages", type=int, default=ROLL_PAGES,
-                        help="pages of the rolling full pass over Awarded and "
-                             f"Cancelled per run (default {ROLL_PAGES})")
+        sp.add_argument("--roll-pages", type=int,
+                        help="cap the rolling full pass over Awarded and "
+                             "Cancelled at this many pages per run. By "
+                             "default the slice is sized from the gap since "
+                             "the last run, so the pass finishes within "
+                             f"--sweep-days at any frequency (never below "
+                             f"{ROLL_PAGES} pages)")
         sp.add_argument("--sweep-days", type=float, default=SWEEP_DAYS,
                         help="start a new rolling pass this many days after "
                              f"the last one finished (default {SWEEP_DAYS})")
@@ -1316,9 +1406,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_crawl)
 
     def register_options(sp):
-        sp.add_argument("--register-pages", type=int, default=REGISTER_PAGES,
-                        help="register pages refreshed per run "
-                             f"(default {REGISTER_PAGES})")
+        sp.add_argument("--register-pages", type=int,
+                        help="cap the register refresh at this many pages "
+                             "per run. By default the slice is sized from "
+                             "the gap since the last run, so a pass finishes "
+                             f"within --register-days (never below "
+                             f"{REGISTER_PAGES} pages)")
         sp.add_argument("--register-days", type=float, default=REGISTER_DAYS,
                         help="start a new register refresh pass this many "
                              f"days after the last (default {REGISTER_DAYS})")
@@ -1417,6 +1510,26 @@ def build_parser() -> argparse.ArgumentParser:
     db(sp)
     sp.add_argument("--out", default="data/monaqasat.slim.db")
     sp.set_defaults(func=cmd_pack)
+
+    sp = sub.add_parser(
+        "compact",
+        help="compress stored pages and reclaim file space",
+        description="Pages fetched from v0.5 on are compressed as they "
+                    "arrive. Run this once on a database written before "
+                    "that: it compresses what is already stored (about ten "
+                    "times smaller) and reclaims the space. Every page still "
+                    "reads back exactly as fetched.")
+    db(sp)
+    sp.add_argument("--no-vacuum", action="store_true",
+                    help="skip reclaiming the file space (VACUUM needs room "
+                         "for a second copy while it runs)")
+    sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--drop-before",
+                    help="also drop the stored copy of pages fetched before "
+                         "this date (YYYY-MM-DD). Their parsed rows and "
+                         "content hashes stay, but they can no longer be "
+                         "re-parsed without re-crawling.")
+    sp.set_defaults(func=cmd_compact)
 
     sp = sub.add_parser("export", help="dump a table to CSV")
     db(sp)

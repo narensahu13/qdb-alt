@@ -22,13 +22,23 @@ How a tender's state is kept (see FIXES.md, "state model"):
 from __future__ import annotations
 
 import sqlite3
+import zlib
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from .fingerprint import canonical_html_sha256
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Stored pages are compressed (v3). Every page on this site carries the same
+# navigation, scripts and styles, so a sample of one page -- kept in
+# blob_dict and handed to zlib as a preset dictionary -- makes the next one
+# about ten times smaller than the raw HTML, where zlib alone manages four.
+# Nothing is thrown away: what comes back out is the page exactly as fetched.
+COMPRESS_LEVEL = 6
+DICT_MIN = 16384         # a page smaller than this is a poor sample
+DICT_WINDOW = 32768      # zlib's largest preset dictionary
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_page (
@@ -40,7 +50,19 @@ CREATE TABLE IF NOT EXISTS raw_page (
     fetched_at  TEXT NOT NULL,
     first_seen_at TEXT,
     content_sha256 TEXT,
-    html        TEXT
+    html        TEXT,                   -- only pages stored before v3
+    body        BLOB,                   -- the page, compressed (see comp)
+    comp        TEXT                    -- NULL plain html | 'z' | 'zd:<id>'
+);
+
+-- Samples used as zlib preset dictionaries, one per page kind. Kept in the
+-- database because a page cannot be read back without the sample it was
+-- compressed against.
+CREATE TABLE IF NOT EXISTS blob_dict (
+    dict_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT,
+    data       BLOB NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tender (
@@ -275,6 +297,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def compress_html(html: str, zdict: bytes | None = None,
+                  dict_id: int | None = None) -> tuple[bytes, str]:
+    """The page as stored: compressed bytes, and how to read them back."""
+    raw = html.encode("utf-8")
+    if zdict and dict_id:
+        co = zlib.compressobj(COMPRESS_LEVEL, zlib.DEFLATED, zlib.MAX_WBITS,
+                              9, 0, zdict=zdict)
+        return co.compress(raw) + co.flush(), f"zd:{dict_id}"
+    return zlib.compress(raw, COMPRESS_LEVEL), "z"
+
+
+def decompress_html(body: Any, comp: str | None,
+                    zdict: bytes | None = None) -> str:
+    """The page exactly as it was fetched."""
+    if not comp:
+        return body if isinstance(body, str) else bytes(body).decode("utf-8")
+    if comp == "z":
+        return zlib.decompress(bytes(body)).decode("utf-8")
+    if comp.startswith("zd:"):
+        if zdict is None:
+            raise ValueError(f"page needs dictionary {comp[3:]}, which is"
+                             " not in this database")
+        do = zlib.decompressobj(zlib.MAX_WBITS, zdict=zdict)
+        return (do.decompress(bytes(body)) + do.flush()).decode("utf-8")
+    raise ValueError(f"unknown compression {comp!r}")
+
+
 # How far along its life a tender is. Cancelled is terminal.
 STATE_RANK = {
     None: -1, "future": 0, "published": 1, "closed": 2, "technical": 3,
@@ -301,12 +350,18 @@ def companies_ref(tender_id: str, state: str | None) -> str:
     return f"{tender_id}@{state or ''}"
 
 
-def pack_database(src: str, dest: str) -> int:
-    """Copy the database without stored HTML.
+# Left out of a packed copy: the pages themselves (nearly all of the size),
+# the samples that only exist to read them back, and the match table, which
+# holds your customers' ids and names and has no business leaving the bank.
+PACK_SKIP = ("raw_page", "blob_dict", "match")
 
-    raw_page is almost all of the file size (the pages themselves). Crawl
-    progress, tenders and companies live in the other tables, so a laptop
-    can resume from the packed copy. Returns the new file size in bytes.
+
+def pack_database(src: str, dest: str) -> int:
+    """Copy the database without the stored pages or any customer matches.
+
+    raw_page is almost all of the file size. Crawl progress, tenders and
+    companies live in the other tables, so a laptop can resume from the
+    packed copy. Returns the new file size in bytes.
     """
     src_path = Path(src).resolve()
     dest_path = Path(dest).resolve()
@@ -330,7 +385,7 @@ def pack_database(src: str, dest: str) -> int:
         tables = [
             name for name, sql in objects
             if sql.lstrip().upper().startswith("CREATE TABLE")
-            and name != "raw_page"
+            and name not in PACK_SKIP
         ]
         dst.execute("ATTACH DATABASE ? AS src", (str(src_path),))
         for name in tables:
@@ -349,6 +404,8 @@ def pack_database(src: str, dest: str) -> int:
 class Store:
     def __init__(self, path: str):
         self.path = path
+        self._dict_data: dict[int, bytes | None] = {}
+        self._dict_by_kind: dict[str, int | None] = {}
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -402,6 +459,9 @@ class Store:
 
         self._add("feature_cr_month", "decided_12m_count", "INTEGER")
 
+        self._add("raw_page", "body", "BLOB")
+        self._add("raw_page", "comp", "TEXT")
+
         # Sightings and the fetch log, rebuilt from what is on disk for
         # databases that predate them, so the first run does not refetch.
         if c.execute("SELECT COUNT(*) FROM sighting").fetchone()[0] == 0:
@@ -432,6 +492,11 @@ class Store:
         version = c.execute("PRAGMA user_version").fetchone()[0]
         if version < 2:
             self._migrate_to_2()
+        if version < SCHEMA_VERSION:
+            # v3 only adds the columns above. Pages already on disk stay as
+            # they are until `compact` is run, so opening a 1 GB database
+            # stays instant.
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
     def _migrate_to_2(self) -> None:
@@ -482,15 +547,59 @@ class Store:
         #    those pages be tried again under the new ones.
         c.execute("DELETE FROM failed_page WHERE kind LIKE '%:%'"
                   " AND kind NOT LIKE 'missing:%'")
-        c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        c.execute("PRAGMA user_version = 2")
 
     def close(self) -> None:
         self.conn.close()
 
-    # -- raw ------------------------------------------------------------
+    # -- stored pages -----------------------------------------------------
+    def _zdict(self, dict_id: int) -> bytes | None:
+        if dict_id not in self._dict_data:
+            row = self.conn.execute(
+                "SELECT data FROM blob_dict WHERE dict_id=?",
+                (dict_id,)).fetchone()
+            self._dict_data[dict_id] = bytes(row["data"]) if row else None
+        return self._dict_data[dict_id]
+
+    def _dict_for(self, kind: str, html: str) -> tuple[int | None, bytes | None]:
+        """The sample pages of this kind are compressed against, created
+        from the first page big enough to be a useful one."""
+        key = kind or ""
+        if key not in self._dict_by_kind:
+            row = self.conn.execute(
+                "SELECT dict_id FROM blob_dict WHERE kind=?"
+                " ORDER BY dict_id DESC LIMIT 1", (key,)).fetchone()
+            self._dict_by_kind[key] = row["dict_id"] if row else None
+        if self._dict_by_kind[key] is None:
+            data = html.encode("utf-8")
+            if len(data) < DICT_MIN:
+                return None, None               # too small to learn from
+            cur = self.conn.execute(
+                "INSERT INTO blob_dict (kind, data, created_at)"
+                " VALUES (?,?,?)", (key, data[-DICT_WINDOW:], _now()))
+            self._dict_by_kind[key] = cur.lastrowid
+            self._dict_data[cur.lastrowid] = data[-DICT_WINDOW:]
+        did = self._dict_by_kind[key]
+        return did, self._zdict(did)
+
+    def html_of(self, row: sqlite3.Row) -> str | None:
+        """A stored page, in the form it was fetched, whether it was written
+        before or after compression arrived."""
+        keys = row.keys()
+        comp = row["comp"] if "comp" in keys else None
+        if not comp:
+            return row["html"] if "html" in keys else None
+        body = row["body"]
+        if body is None:
+            return None
+        zdict = (self._zdict(int(comp.split(":", 1)[1]))
+                 if comp.startswith("zd:") else None)
+        return decompress_html(body, comp, zdict)
+
     def save_page(self, url: str, kind: str, html: str, *, status: int = 200,
                   tender_id: str | None = None, page: int | None = None) -> str:
-        """Store raw HTML. Returns new | changed | unchanged.
+        """Store the page as fetched, compressed. Returns
+        new | changed | unchanged.
 
         Unchanged means the canonical content hash matches what we already
         hold -- Dynatrace script noise is ignored -- so a periodic crawl
@@ -508,31 +617,82 @@ class Store:
             self.conn.commit()
             return "unchanged"
         first = prev["first_seen_at"] if prev and prev["first_seen_at"] else now
+        dict_id, zdict = self._dict_for(kind, html)
+        body, comp = compress_html(html, zdict, dict_id)
         self.conn.execute(
             "INSERT INTO raw_page"
             " (url, kind, tender_id, page, status, fetched_at, first_seen_at,"
-            "  content_sha256, html)"
-            " VALUES (?,?,?,?,?,?,?,?,?)"
+            "  content_sha256, html, body, comp)"
+            " VALUES (?,?,?,?,?,?,?,?,NULL,?,?)"
             " ON CONFLICT(url) DO UPDATE SET"
             " kind=excluded.kind, tender_id=excluded.tender_id,"
             " page=excluded.page, status=excluded.status,"
             " fetched_at=excluded.fetched_at,"
-            " content_sha256=excluded.content_sha256, html=excluded.html",
-            (url, kind, tender_id, page, status, now, first, sha, html),
+            " content_sha256=excluded.content_sha256, html=NULL,"
+            " body=excluded.body, comp=excluded.comp",
+            (url, kind, tender_id, page, status, now, first, sha, body, comp),
         )
         self.conn.commit()
         return "changed" if prev is not None else "new"
 
     def has_page(self, url: str) -> bool:
         cur = self.conn.execute(
-            "SELECT 1 FROM raw_page WHERE url=? AND html IS NOT NULL"
-            " AND length(html) > 0", (url,))
+            "SELECT 1 FROM raw_page WHERE url=?"
+            " AND (length(COALESCE(html, '')) > 0"
+            "      OR length(COALESCE(body, '')) > 0)", (url,))
         return cur.fetchone() is not None
 
     def pages(self, kind: str) -> Iterable[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM raw_page WHERE kind=? ORDER BY page, tender_id",
             (kind,))
+
+    def compact(self, batch: int = 500, progress=None,
+                drop_before: str | None = None) -> dict[str, int]:
+        """Compress pages that are still stored as plain HTML, and
+        optionally drop the stored copy of pages fetched before a date.
+
+        Nothing parsed is touched: this only changes how the pages
+        themselves are held. Returns what it did, in bytes.
+        """
+        c = self.conn
+        done = before = after = 0
+        while True:
+            rows = c.execute(
+                "SELECT url, kind, html FROM raw_page"
+                " WHERE comp IS NULL AND html IS NOT NULL LIMIT ?",
+                (batch,)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                html = row["html"]
+                dict_id, zdict = self._dict_for(row["kind"], html)
+                body, comp = compress_html(html, zdict, dict_id)
+                before += len(html.encode("utf-8"))
+                after += len(body)
+                c.execute("UPDATE raw_page SET html=NULL, body=?, comp=?"
+                          " WHERE url=?", (body, comp, row["url"]))
+                done += 1
+            c.commit()
+            if progress:
+                progress(done)
+        dropped = 0
+        if drop_before:
+            cur = c.execute(
+                "UPDATE raw_page SET html=NULL, body=NULL, comp=NULL"
+                " WHERE fetched_at < ? AND (html IS NOT NULL OR body IS NOT NULL)",
+                (drop_before,))
+            dropped = cur.rowcount
+            c.commit()
+        return {"compressed": done, "bytes before": before,
+                "bytes after": after, "dropped": dropped}
+
+    def stored_bytes(self) -> dict[str, int]:
+        """How much of the file the stored pages account for, by kind."""
+        return {r["kind"]: r["n"] for r in self.conn.execute(
+            "SELECT kind, SUM(COALESCE(length(body), 0)"
+            "             + COALESCE(length(html), 0)) n"
+            " FROM raw_page GROUP BY kind ORDER BY n DESC")}
 
     # -- parsed ---------------------------------------------------------
     def upsert_tender(self, row: dict[str, Any], source_url: str = "") -> None:
@@ -929,6 +1089,34 @@ class Store:
         self.conn.commit()
         return self.conn.execute("SELECT * FROM run WHERE run_id=?",
                                  (run_id,)).fetchone()
+
+    def days_since_last_run(self, command: str | None = None,
+                            exclude_run_id: int | None = None) -> float:
+        """How long since this command last ran, in days.
+
+        What makes the rolling passes fit the way the tool is actually used:
+        nightly runs take a slice each night, a run a month later has to
+        cover the section itself. 1.0 when there is nothing to compare to.
+        """
+        sql = "SELECT MAX(started_at) FROM run WHERE started_at IS NOT NULL"
+        params: list[Any] = []
+        if command:
+            sql += " AND command=?"
+            params.append(command)
+        if exclude_run_id is not None:
+            sql += " AND run_id != ?"
+            params.append(exclude_run_id)
+        row = self.conn.execute(sql, params).fetchone()
+        if not row or not row[0]:
+            return 1.0
+        try:
+            then = datetime.fromisoformat(row[0])
+        except ValueError:
+            return 1.0
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        return max((datetime.now(timezone.utc) - then).total_seconds() / 86400,
+                   0.0)
 
     def runs(self, limit: int = 10) -> list[sqlite3.Row]:
         return self.conn.execute(
