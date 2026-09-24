@@ -171,6 +171,59 @@ subsidiary, a branch with its own registration. Give each its own row under
 the same customer id: every row is matched, the results are filed under that
 one id, and a branch number like `29309/4` reaches the parent anyway.
 
+### What comes out, and what a model can do with it
+
+`--out` writes one row per company row on a tender, not one row per "this
+customer matched something". Each row carries the facts the match is only
+useful with: `closing_date`, `awarded_date`, `event_date` (with
+`event_date_basis` saying which of them it is), `company_value` -- the amount
+that company was awarded or bid, which is not the tender's total when several
+companies share it -- `buyer` (the awarding body), `won`, `decided`,
+`companies_on_tender`, and the tender's ICV requirement beside that company's
+own `local_value_ratio`.
+
+`--features` writes the same thing rolled up to one row per client per month,
+which is the shape a PD model consumes. Every row is point-in-time: a row
+dated June 2025 uses no event after June 2025, so a 2025 application is never
+scored with a 2026 contract.
+
+```powershell
+python -m monaqasat match --customers customer-data\book.xlsx ^
+    --counterparties customer-data\top-counterparties.csv ^
+    --out matches.csv --features client-months.csv
+```
+
+### A client's buyers and suppliers
+
+The transaction model gives each client its top buyers and sellers by name.
+`--counterparties` takes them as `client_id, name, direction` (and optionally
+`rank`, `amount`), and every row in the output says, in `relation`, whether it
+is about the borrower itself or one of its counterparties.
+
+Those names come off bank narrations: truncated, abbreviated, and with no
+registration number behind them. So they are matched on the name alone, at a
+stricter bar than the customer book (0.97 against 0.92), and **every one is
+flagged `needs_review`, even an exact name match**. `AL WAKRA FOOD` against
+`AL WAKRA FOODS` scores 0.95: over the bar for a borrower whose file you can
+open and check, under it for a name off a statement, where a wrong join puts
+a stranger's contract history on the borrower. The client-month table carries
+`counterparty_review_share` so it is visible how much of that signal rests on
+a name alone.
+
+For a live run on one applicant:
+
+```powershell
+python -m monaqasat match --customers book.xlsx --counterparties cps.csv ^
+    --client CIF-1 --out one-client.csv
+```
+
+That re-matches only that client. A counterparty run does not disturb the
+borrower's own stored matches, which came from the book and have nothing to
+do with it.
+
+A direction the loader does not recognise stays `counterparty` rather than
+being guessed -- a supplier counted as a customer inverts the signal.
+
 It needs a name column, a CR number column, or both; a customer id is
 optional. Common header variants are recognised -- `CIF No`, `Customer Name`,
 `C.R. No.`, `Commercial Registration Number` and so on -- and the command

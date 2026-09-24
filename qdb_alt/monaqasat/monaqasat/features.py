@@ -194,3 +194,147 @@ def _features_for(cr_root: str, as_of: date, events: list[dict[str, Any]],
         "built_at": _now(),
     }
     return rec
+
+
+# --------------------------------------------------------------------------
+# client-by-month features
+#
+# feature_cr_month above is keyed by commercial registration number: it says
+# what a company has been doing. This is keyed by QDB client, and adds the
+# part the transaction model contributes -- what the borrower's own top
+# buyers and suppliers have been doing, which is a read on the demand behind
+# its receivables and the solidity of its supply.
+#
+# The same point-in-time rule holds throughout: a row dated as_of_month uses
+# no event after that month end.
+# --------------------------------------------------------------------------
+
+CLIENT_FEATURE_VERSION = "c1"
+
+
+def _window(events, lo, hi):
+    return [e for e in events if lo < e["date"] <= hi]
+
+
+def _client_month(client_id, as_of, events):
+    """One (client, month) row from that client's matched events."""
+    seen = [e for e in events if e["date"] <= as_of]
+    if not seen:
+        return None
+    y12 = date(as_of.year - 1, as_of.month, 1)
+    y36 = date(as_of.year - 3, as_of.month, 1)
+
+    own = [e for e in seen if e["relation"] == "self"]
+    own_12 = _window(own, y12, as_of)
+    own_36 = _window(own, y36, as_of)
+
+    # A tender is a win or a loss only once its winners are known. One still
+    # under evaluation is neither, so it is left out of the denominator.
+    bids_12 = {e["tender_id"] for e in own_12}
+    decided_12 = {e["tender_id"] for e in own_12 if e["decided"]}
+    wins_12 = {e["tender_id"] for e in own_12 if e["won"]}
+
+    def award_value(rows):
+        # Several approved-value lines for one company on one tender are
+        # separate match rows; they are that company's award between them.
+        return sum(e["value"] for e in rows
+                   if e["won"] and e["value"] is not None)
+
+    per_tender: dict[str, float] = defaultdict(float)
+    for e in own_12:
+        if e["won"] and e["value"] is not None:
+            per_tender[e["tender_id"]] += e["value"]
+    buyer_value: dict[str, float] = defaultdict(float)
+    for e in own_12:
+        if e["won"] and e["buyer"] and e["value"] is not None:
+            buyer_value[e["buyer"]] += e["value"]
+
+    wins_all = [e for e in own if e["won"]]
+    last_award = max((e["date"] for e in wins_all), default=None)
+    first_seen = min(e["date"] for e in seen)
+
+    def side(relation):
+        rows = [e for e in seen if e["relation"] == relation]
+        rows_12 = _window(rows, y12, as_of)
+        return {
+            "matched": len({e["party_key"] for e in rows}),
+            "active": len({e["party_key"] for e in rows_12 if e["won"]}),
+            "value": award_value(rows_12) or None,
+            "rows_12": rows_12,
+        }
+
+    buyers, suppliers = side("buyer"), side("supplier")
+    cp_rows = buyers["rows_12"] + suppliers["rows_12"]
+    review = sum(1 for e in cp_rows if e["needs_review"])
+
+    return {
+        "client_id": client_id,
+        "as_of_month": as_of.isoformat(),
+        "self_bids_12m": len(bids_12),
+        "self_decided_12m": len(decided_12),
+        "self_wins_12m": len(wins_12),
+        "self_win_rate_12m": (round(len(wins_12) / len(decided_12), 4)
+                              if len(decided_12) >= 3 else None),
+        "self_award_value_12m": award_value(own_12) or None,
+        "self_award_value_36m": award_value(own_36) or None,
+        "self_largest_award_12m": (max(per_tender.values())
+                                   if per_tender else None),
+        "self_months_since_last_award": (_months_between(last_award, as_of)
+                                         if last_award else None),
+        "self_distinct_buyers_12m": len({e["buyer"] for e in own_12
+                                         if e["won"] and e["buyer"]}),
+        "self_top_buyer_share_12m": (
+            round(max(buyer_value.values()) / sum(buyer_value.values()), 4)
+            if buyer_value and sum(buyer_value.values()) > 0 else None),
+        "self_months_since_first_seen": _months_between(first_seen, as_of),
+        "buyers_matched": buyers["matched"],
+        "buyers_active_12m": buyers["active"],
+        "buyer_award_value_12m": buyers["value"],
+        "suppliers_matched": suppliers["matched"],
+        "suppliers_active_12m": suppliers["active"],
+        "supplier_award_value_12m": suppliers["value"],
+        # How much of the counterparty signal rests on a name alone. A high
+        # share means these numbers are a lead to check, not evidence.
+        "counterparty_review_share": (round(review / len(cp_rows), 4)
+                                      if cp_rows else None),
+        "feature_version": CLIENT_FEATURE_VERSION,
+        "built_at": _now(),
+    }
+
+
+def build_client_months(store: Store, months: int = 60,
+                        as_of_end: date | None = None) -> dict[str, int]:
+    """Rebuild ``client_month`` for the trailing ``months`` window."""
+    by_client: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in store.match_rows():
+        when = _parse_iso(r["event_date"])
+        if when is None:
+            continue
+        by_client[r["client_id"]].append({
+            "date": when,
+            "tender_id": r["tender_id"],
+            "relation": r["relation"],
+            "party_key": (r["party_name"] or "").upper()
+                         if r["relation"] != "self" else "",
+            "won": bool(r["won"]),
+            "decided": bool(r["decided"]),
+            "value": r["company_value"],
+            "buyer": r["buyer"],
+            "needs_review": bool(r["needs_review"]),
+        })
+
+    last = as_of_end or date.today()
+    last = month_end(last.year, last.month)
+    written = 0
+    store.conn.execute("DELETE FROM client_month")
+    for client_id, events in by_client.items():
+        first = min(e["date"] for e in events)
+        start = max(first, date(last.year, last.month, 1) -
+                    timedelta(days=31 * months))
+        rows = []
+        for as_of in _month_sequence(start, last):
+            rec = _client_month(client_id, as_of, events)
+            if rec:
+                rows.append(rec)
+        written += store.save_client_months(rows)
+    return {"clients": len(by_client), "rows": written}

@@ -29,7 +29,7 @@ from typing import Any, Iterable
 
 from .fingerprint import canonical_html_sha256
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Stored pages are compressed (v3). Every page on this site carries the same
 # navigation, scripts and styles, so a sample of one page -- kept in
@@ -165,18 +165,58 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     PRIMARY KEY (kind, page)
 );
 
+-- One row per (client, the party matched for that client, company row on a
+-- tender). `relation` says who the party is to the client: the borrower
+-- itself, or one of the buyers or suppliers the transaction model named.
+-- A client's own rows share an empty party_key, so several registrations
+-- for one borrower collapse onto one match and the strongest wins.
 CREATE TABLE IF NOT EXISTS match (
-    customer_id   TEXT NOT NULL,
+    client_id     TEXT NOT NULL,
+    relation      TEXT NOT NULL,        -- self | buyer | supplier | counterparty
+    party_key     TEXT NOT NULL,        -- '' for the client itself
     tender_id     TEXT NOT NULL,
-    role          TEXT NOT NULL,
+    role          TEXT NOT NULL,        -- awarded | bidder
     seq           INTEGER NOT NULL,
     method        TEXT NOT NULL,        -- cr | name_exact | name_fuzzy | name_translit
     score         REAL,
-    customer_name TEXT,
+    needs_review  INTEGER NOT NULL DEFAULT 0,
+    client_name   TEXT,
+    party_name    TEXT,
+    party_source  TEXT,                 -- book | transactions
+    party_rank    INTEGER,
     matched_name  TEXT,
     matched_cr    TEXT,
     matched_at    TEXT,
-    PRIMARY KEY (customer_id, tender_id, role, seq)
+    PRIMARY KEY (client_id, relation, party_key, tender_id, role, seq)
+);
+CREATE INDEX IF NOT EXISTS match_client ON match(client_id, relation);
+
+-- Point-in-time features, one row per client per month. Nothing dated
+-- as_of_month uses an event after it.
+CREATE TABLE IF NOT EXISTS client_month (
+    client_id                    TEXT NOT NULL,
+    as_of_month                  TEXT NOT NULL,
+    self_bids_12m                INTEGER,
+    self_decided_12m             INTEGER,
+    self_wins_12m                INTEGER,
+    self_win_rate_12m            REAL,
+    self_award_value_12m         REAL,
+    self_award_value_36m         REAL,
+    self_largest_award_12m       REAL,
+    self_months_since_last_award INTEGER,
+    self_distinct_buyers_12m     INTEGER,
+    self_top_buyer_share_12m     REAL,
+    self_months_since_first_seen INTEGER,
+    buyers_matched               INTEGER,
+    buyers_active_12m            INTEGER,
+    buyer_award_value_12m        REAL,
+    suppliers_matched            INTEGER,
+    suppliers_active_12m         INTEGER,
+    supplier_award_value_12m     REAL,
+    counterparty_review_share    REAL,
+    feature_version              TEXT,
+    built_at                     TEXT,
+    PRIMARY KEY (client_id, as_of_month)
 );
 
 -- Every section a tender has been listed in. Page numbers shift as new
@@ -353,7 +393,24 @@ def companies_ref(tender_id: str, state: str | None) -> str:
 # Left out of a packed copy: the pages themselves (nearly all of the size),
 # the samples that only exist to read them back, and the match table, which
 # holds your customers' ids and names and has no business leaving the bank.
-PACK_SKIP = ("raw_page", "blob_dict", "match")
+PACK_SKIP = ("raw_page", "blob_dict", "match", "client_month")
+
+
+def _ddl_for(table: str) -> str:
+    """The CREATE statements for one table, lifted out of SCHEMA.
+
+    Used by the migrations, so a rebuilt table is defined in exactly one
+    place and cannot drift from the schema the rest of the file assumes.
+    """
+    import re
+    want = re.compile(
+        r"CREATE (?:TABLE|INDEX)(?: IF NOT EXISTS)? \w*\s*"
+        r"(?:ON )?\b" + re.escape(table) + r"\b", re.I)
+    out = [s.strip() + ";" for s in SCHEMA.split(";")
+           if s.strip() and want.search(s)]
+    if not out:
+        raise KeyError(f"no DDL for {table!r} in SCHEMA")
+    return "\n".join(out)
 
 
 def pack_database(src: str, dest: str) -> int:
@@ -412,6 +469,10 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        # The match table is rebuilt in v4, so it has to be reshaped before
+        # the schema runs: CREATE TABLE IF NOT EXISTS leaves an old table
+        # alone, and the index beside it then names a column it has not got.
+        self._migrate_to_4()
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._migrate()
@@ -497,6 +558,34 @@ class Store:
             # they are until `compact` is run, so opening a 1 GB database
             # stays instant.
             c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        c.commit()
+
+    def _migrate_to_4(self) -> None:
+        """The match table gains the client/counterparty structure.
+
+        Before v4 a match was (customer, tender, role, seq) and every row was
+        the borrower itself. Those rows are carried over as relation='self'
+        from the customer book, which is exactly what they were.
+        """
+        c = self.conn
+        cols = {r[1] for r in c.execute("PRAGMA table_info(match)")}
+        if not cols or "client_id" in cols:
+            return
+        c.execute("ALTER TABLE match RENAME TO match_v3")
+        c.executescript(_ddl_for("match"))
+        c.execute(
+            "INSERT OR REPLACE INTO match (client_id, relation, party_key,"
+            " tender_id, role, seq, method, score, needs_review, client_name,"
+            " party_name, party_source, party_rank, matched_name, matched_cr,"
+            " matched_at)"
+            " SELECT customer_id, 'self', '', tender_id, role, seq, method,"
+            "        score,"
+            "        CASE WHEN method IN ('name_fuzzy','name_translit')"
+            "             THEN 1 ELSE 0 END,"
+            "        customer_name, customer_name, 'book', NULL,"
+            "        matched_name, matched_cr, matched_at"
+            " FROM match_v3")
+        c.execute("DROP TABLE match_v3")
         c.commit()
 
     def _migrate_to_2(self) -> None:
@@ -1159,25 +1248,102 @@ class Store:
     # -- matches --------------------------------------------------------
     def save_matches(self, rows: list[dict[str, Any]]) -> None:
         for r in rows:
+            client = r.get("client_id", r.get("customer_id"))
             self.conn.execute(
-                "INSERT OR REPLACE INTO match (customer_id, tender_id, role,"
-                " seq, method, score, customer_name, matched_name, matched_cr,"
-                " matched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (r["customer_id"], r["tender_id"], r["role"], r.get("seq", 0),
-                 r["method"], r.get("score"), r.get("customer_name"),
+                "INSERT OR REPLACE INTO match (client_id, relation, party_key,"
+                " tender_id, role, seq, method, score, needs_review,"
+                " client_name, party_name, party_source, party_rank,"
+                " matched_name, matched_cr, matched_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (client, r.get("relation", "self"), r.get("party_key", ""),
+                 r["tender_id"], r["role"], r.get("seq", 0), r["method"],
+                 r.get("score"),
+                 int(r.get("needs_review",
+                           r["method"] in ("name_fuzzy", "name_translit"))),
+                 r.get("client_name", r.get("customer_name")),
+                 r.get("party_name", r.get("customer_name")),
+                 r.get("party_source", "book"), r.get("party_rank"),
                  r.get("matched_name"), r.get("matched_cr"), _now()),
             )
         self.conn.commit()
 
-    def clear_matches(self, customer_ids: Iterable[str] | None = None) -> None:
-        """Clear all matches, or only those of the given customers -- so a
-        re-run never leaves yesterday's matches next to today's."""
-        if customer_ids is None:
+    def clear_matches(self, client_ids: Iterable[str] | None = None,
+                      relations: Iterable[str] | None = None) -> None:
+        """Clear all matches, or only those of the given clients -- so a
+        re-run never leaves yesterday's matches next to today's.
+
+        `relations` narrows it further: a live run for one client's
+        counterparties should not wipe the borrower's own matched history,
+        which was built from the book and has nothing to do with it.
+        """
+        if client_ids is None and relations is None:
             self.conn.execute("DELETE FROM match")
+        elif client_ids is None:
+            self.conn.executemany("DELETE FROM match WHERE relation=?",
+                                  [(r,) for r in set(relations)])
+        elif relations is None:
+            self.conn.executemany("DELETE FROM match WHERE client_id=?",
+                                  [(c,) for c in set(client_ids)])
         else:
-            self.conn.executemany("DELETE FROM match WHERE customer_id=?",
-                                  [(c,) for c in set(customer_ids)])
+            self.conn.executemany(
+                "DELETE FROM match WHERE client_id=? AND relation=?",
+                [(c, r) for c in set(client_ids) for r in set(relations)])
         self.conn.commit()
+
+    # Every fact a match carries, for the export and the features. The
+    # company row's own `value` is the amount for that company on that
+    # tender -- the bid, or the award -- which is not the same as the
+    # tender's total awarded_amount when several companies share it.
+    MATCH_ROWS_SQL = (
+        "SELECT m.client_id, m.client_name, m.relation, m.party_name,"
+        "       m.party_source, m.party_rank, m.method AS match_method,"
+        "       m.score AS match_score, m.needs_review, m.matched_name,"
+        "       m.matched_cr, m.tender_id, t.tender_number, t.subject,"
+        "       t.ministry AS buyer, t.sector_type, t.tender_type, t.family,"
+        "       t.state AS tender_state, m.role, c.stage,"
+        "       CASE WHEN m.role='awarded' THEN 1 ELSE 0 END AS won,"
+        "       t.publish_date, t.closing_date, t.technical_open_date,"
+        "       t.financial_open_date, t.awarded_date,"
+        "       COALESCE(t.awarded_date, t.closing_date, t.publish_date)"
+        "         AS event_date,"
+        "       CASE WHEN t.awarded_date IS NOT NULL THEN 'awarded'"
+        "            WHEN t.closing_date IS NOT NULL THEN 'closing'"
+        "            ELSE 'published' END AS event_date_basis,"
+        "       c.value AS company_value, t.awarded_amount,"
+        "       c.financial_result, c.local_value_ratio, t.local_value_system,"
+        "       (SELECT COUNT(*) FROM company x WHERE x.tender_id=m.tender_id)"
+        "         AS companies_on_tender,"
+        "       (SELECT COUNT(*) FROM company x WHERE x.tender_id=m.tender_id"
+        "          AND x.role='awarded') > 0 AS decided,"
+        "       m.matched_at"
+        " FROM match m"
+        " JOIN company c ON c.tender_id=m.tender_id AND c.role=m.role"
+        "               AND c.seq=m.seq"
+        " JOIN tender t ON t.tender_id=m.tender_id"
+    )
+
+    def match_rows(self, client_ids: Iterable[str] | None = None
+                   ) -> list[sqlite3.Row]:
+        sql = self.MATCH_ROWS_SQL
+        params: tuple = ()
+        ids = list(client_ids) if client_ids is not None else None
+        if ids:
+            sql += " WHERE m.client_id IN (%s)" % ",".join("?" * len(ids))
+            params = tuple(ids)
+        sql += " ORDER BY m.client_id, m.relation, event_date DESC"
+        return self.conn.execute(sql, params).fetchall()
+
+    def save_client_months(self, rows: Iterable[dict[str, Any]]) -> int:
+        n = 0
+        for r in rows:
+            cols = ", ".join(r)
+            marks = ", ".join("?" * len(r))
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO client_month ({cols})"
+                f" VALUES ({marks})", tuple(r.values()))
+            n += 1
+        self.conn.commit()
+        return n
 
     # -- reads ----------------------------------------------------------
     def companies(self) -> list[sqlite3.Row]:

@@ -29,9 +29,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .fetch import Blocked, Fetcher, PageTimeout
-from .match import (FUZZY_THRESHOLD, TRANSLIT_THRESHOLD, load_customers_report,
-                    match_classified, match_customers, print_load_report,
-                    summarise)
+from .features import build_client_months
+from .match import (FUZZY_THRESHOLD, TRANSLIT_THRESHOLD, load_counterparties,
+                    load_customers_report, match_classified, match_customers,
+                    match_parties, parties, print_counterparty_report,
+                    print_load_report, summarise)
 from .normalize import cr_root
 from .parse import (BID_KINDS, COMPANY_KINDS, LISTING_KINDS, TENDER_KINDS,
                     kind_from_url, kind_path, last_listing_page, looks_rejected,
@@ -1025,16 +1027,42 @@ def cmd_match(args) -> int:
             print("Nothing crawled yet. Run `crawl` first.", file=sys.stderr)
         return 1
 
-    matches = match_customers(customers, companies,
-                              fuzzy_threshold=args.fuzzy,
-                              translit_threshold=args.translit)
-    # This file's customers are matched afresh; nobody else's are touched.
+    wanted = set(getattr(args, "client", None) or ())
+    if wanted:
+        customers = [c for c in customers if c["customer_id"] in wanted]
+        if not customers:
+            print(f"none of {', '.join(sorted(wanted))} are in "
+                  f"{args.customers}", file=sys.stderr)
+            return 1
+
+    counterparties: list[dict] = []
+    if getattr(args, "counterparties", None):
+        try:
+            counterparties, cp_report = load_counterparties(
+                args.counterparties, getattr(args, "counterparty_sheet", None))
+        except (ValueError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if wanted:
+            counterparties = [c for c in counterparties
+                              if c["client_id"] in wanted]
+        print_counterparty_report(cp_report)
+
+    party_rows = parties(customers, counterparties)
+    matches = match_parties(party_rows, companies,
+                            fuzzy_threshold=args.fuzzy,
+                            translit_threshold=args.translit)
+    # This file's clients are matched afresh; nobody else's are touched.
     store.clear_matches(None if args.replace
-                        else [c["customer_id"] for c in customers])
+                        else [c["customer_id"] for c in customers]
+                        or [c["client_id"] for c in counterparties])
     store.save_matches(matches)
 
     s = summarise(matches)
-    print(f"{len(customers)} customers against {len(companies)} company rows")
+    print(f"{len(customers)} customers"
+          + (f" and {len(counterparties)} counterparties" if counterparties
+             else "")
+          + f" against {len(companies)} company rows")
     print(f"  matches            {s['matches']}")
     print(f"  customers matched  {s['customers matched']}")
     for method, n in s["by method"].items():
@@ -1064,9 +1092,32 @@ def cmd_match(args) -> int:
                   f"{row['size'] or '-':<8} {row['evaluation'] or '-':<12} "
                   f"cert to {row['certificate_end'] or '-'}")
 
+    by_relation: dict[str, int] = {}
+    for m in matches:
+        by_relation[m["relation"]] = by_relation.get(m["relation"], 0) + 1
+    if len(by_relation) > 1 or "self" not in by_relation:
+        print("\n  by relation")
+        for rel, n in sorted(by_relation.items()):
+            print(f"    {rel:<14} {n}")
+
     if args.out:
-        _write_csv(args.out, matches)
-        print(f"\nwrote {args.out}")
+        ids = ([c["customer_id"] for c in customers]
+               + [c["client_id"] for c in counterparties])
+        rows = [dict(r) for r in store.match_rows(sorted(set(ids)) or None)]
+        _write_csv(args.out, rows)
+        print(f"\nwrote {args.out}: {len(rows)} rows, one per company row on "
+              "a tender, with the dates, the amount that company was awarded "
+              "or bid, and the body that awarded it")
+
+    if getattr(args, "features", None):
+        built = build_client_months(store, months=args.feature_months)
+        rows = [dict(r) for r in store.conn.execute(
+            "SELECT * FROM client_month ORDER BY client_id, as_of_month")]
+        _write_csv(args.features, rows)
+        print(f"wrote {args.features}: {built['rows']} client-months over "
+              f"{built['clients']} client(s), point-in-time -- a row dated a "
+              "month uses no event after it")
+
     store.close()
     return 0
 
@@ -1314,7 +1365,7 @@ def cmd_profile(args) -> int:
         " FROM match m JOIN tender t USING (tender_id)"
         " JOIN company c ON c.tender_id=m.tender_id AND c.role=m.role"
         "                AND c.seq=m.seq"
-        " WHERE m.customer_id=?"
+        " WHERE m.client_id=? AND m.relation='self'"
         " ORDER BY COALESCE(t.awarded_date, t.closing_date) DESC",
         (args.customer,)).fetchall()
 
@@ -1537,6 +1588,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "(and name_ar); common variants of those headers "
                          "are recognised")
     sp.add_argument("--sheet", help="worksheet name, for .xlsx (default first)")
+    sp.add_argument("--counterparties",
+                    help="a client's top buyers and suppliers from the "
+                         "transaction model -- client_id, name, direction "
+                         "(and optionally rank, amount). These carry no CR "
+                         "number, so they are matched on the name alone, at "
+                         "a stricter bar, and every one is flagged")
+    sp.add_argument("--counterparty-sheet",
+                    help="worksheet name for an .xlsx counterparty list")
+    sp.add_argument("--client", action="append",
+                    help="only these client ids (repeatable) -- for a live "
+                         "run on one applicant")
+    sp.add_argument("--features",
+                    help="also write the client-by-month feature table here")
+    sp.add_argument("--feature-months", type=int, default=60,
+                    help="how many months of features to build (default 60)")
     sp.add_argument("--fuzzy", type=float, default=FUZZY_THRESHOLD,
                     help="similar-name threshold, same script "
                          f"(default {FUZZY_THRESHOLD}; 1 turns it off)")

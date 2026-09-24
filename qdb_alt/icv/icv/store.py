@@ -130,6 +130,31 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     value TEXT
 );
 
+-- Point-in-time features, one row per matched client per month. A row dated
+-- a month is built only from observations published on or before it.
+CREATE TABLE IF NOT EXISTS client_month (
+    client_id                TEXT NOT NULL,
+    as_of_month              TEXT NOT NULL,
+    company_id               TEXT,
+    industry                 TEXT,
+    score                    REAL,
+    score_date               TEXT,
+    score_change_12m         REAL,
+    organic_change_12m       REAL,
+    policy_change_12m        REAL,
+    months_since_last_change INTEGER,
+    months_certified         INTEGER,
+    observations             INTEGER,
+    status                   TEXT,
+    days_to_expiry           INTEGER,
+    standing_known           INTEGER,
+    industry_median          REAL,
+    vs_industry              REAL,
+    feature_version          TEXT,
+    built_at                 TEXT,
+    PRIMARY KEY (client_id, as_of_month)
+);
+
 -- Customer identities. Never leaves this file: excluded from `pack`, and
 -- there is a test that fails if it ever appears in a packed copy.
 CREATE TABLE IF NOT EXISTS match (
@@ -144,7 +169,7 @@ CREATE TABLE IF NOT EXISTS match (
 );
 """
 
-PACK_SKIP = ("raw_page", "match")
+PACK_SKIP = ("raw_page", "match", "client_month")
 
 
 def _now() -> str:
@@ -455,6 +480,18 @@ class Store:
                 " VALUES(?,?,?,?,?,?,?)",
                 (m["customer_id"], m["company_id"], m.get("method"),
                  m.get("matched_on"), m.get("confidence"), run_id, _now()))
+            n += 1
+        self.conn.commit()
+        return n
+
+    def save_client_months(self, rows: Iterable[dict[str, Any]]) -> int:
+        n = 0
+        for r in rows:
+            cols = ", ".join(r)
+            marks = ", ".join("?" * len(r))
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO client_month ({cols})"
+                f" VALUES ({marks})", tuple(r.values()))
             n += 1
         self.conn.commit()
         return n

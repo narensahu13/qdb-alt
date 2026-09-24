@@ -181,11 +181,11 @@ class MultiWinnerTenders(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store, _ = self._matches(tmp)
             rows = store.conn.execute(
-                "SELECT m.customer_id, SUM(c.value) v FROM match m"
+                "SELECT m.client_id, SUM(c.value) v FROM match m"
                 " JOIN company c ON c.tender_id=m.tender_id"
                 "   AND c.role=m.role AND c.seq=m.seq"
-                " WHERE m.role='awarded' GROUP BY m.customer_id").fetchall()
-            got = {r["customer_id"]: round(r["v"], 2) for r in rows}
+                " WHERE m.role='awarded' GROUP BY m.client_id").fetchall()
+            got = {r["client_id"]: round(r["v"], 2) for r in rows}
             self.assertEqual(got, {"NAJM": 1481863.33, "KYRWY": 337800.00})
             store.close()
 

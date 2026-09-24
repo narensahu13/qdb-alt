@@ -516,6 +516,240 @@ def match_customers(
                 translit_threshold)
 
 
+# --------------------------------------------------------------------------
+# clients and their counterparties
+#
+# A borrower is matched on its CR, which is a join. Its top buyers and
+# suppliers come out of the transaction model as names lifted from statement
+# narrations -- truncated, abbreviated, no registration number -- so they can
+# only be matched on the name, and a name that looks similar means much less
+# than it does for a name typed into the customer book. They get a stricter
+# bar and every one of them is flagged.
+# --------------------------------------------------------------------------
+
+TXN_FUZZY_THRESHOLD = 0.97
+TXN_TRANSLIT_THRESHOLD = 0.96
+
+RELATIONS = ("self", "buyer", "supplier")
+
+COUNTERPARTY_ALIASES = {
+    "client_id": ("customerid", "cif", "cifno", "cifnumber", "clientid",
+                  "borrowerid", "customer"),
+    "name": ("counterparty", "counterpartyname", "partyname", "buyername",
+             "suppliername", "sellername", "vendorname", "tradingpartner"),
+    "direction": ("relation", "type", "role", "partytype", "side",
+                  "buyerorsupplier"),
+    "rank": ("position", "order", "topn", "rnk"),
+    "amount": ("value", "totalamount", "turnover", "volume"),
+    "transactions": ("txncount", "transactioncount", "ntransactions", "count"),
+}
+
+_BUYER_WORDS = {"buyer", "buyers", "customer", "customers", "receivable",
+                "receivables", "sales", "debtor", "inflow", "in", "sold",
+                "sell", "seller"}
+_SUPPLIER_WORDS = {"supplier", "suppliers", "vendor", "vendors", "payable",
+                   "payables", "purchase", "purchases", "creditor",
+                   "outflow", "out", "bought", "buy"}
+
+
+def _direction(raw: Any) -> str:
+    """'buyer' or 'supplier' from whatever the transaction model calls it.
+
+    Anything unrecognised stays as 'counterparty' rather than being guessed
+    into one side: a supplier counted as a customer would invert the signal.
+    """
+    word = "".join(ch for ch in str(raw or "").lower() if ch.isalpha())
+    if word in _BUYER_WORDS:
+        return "buyer"
+    if word in _SUPPLIER_WORDS:
+        return "supplier"
+    return "counterparty"
+
+
+def load_counterparties(path: str | Path, sheet: str | None = None
+                        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """A client's top buyers and suppliers, as the transaction model gives
+    them: one row per (client, counterparty name, direction)."""
+    path = Path(path)
+    report: dict[str, Any] = {"file": str(path), "warnings": [], "notes": []}
+
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        headers, data = _read_xlsx(path, sheet)
+        report["read as"] = f"xlsx sheet {sheet or 'first'}"
+    else:
+        text, encoding, notes = detect_encoding(path.read_bytes())
+        report["read as"] = encoding
+        report["warnings"].extend(notes)
+        rows = list(csv.reader(text.splitlines()))
+        headers, data = (rows[0] if rows else []), rows[1:]
+
+    mapping: dict[str, str] = {}
+    normed = {_norm_header(h): h for h in headers if h is not None}
+    for field, aliases in COUNTERPARTY_ALIASES.items():
+        if _norm_header(field) in normed:
+            mapping[field] = normed[_norm_header(field)]
+            continue
+        for alias in aliases:
+            if alias in normed:
+                mapping[field] = normed[alias]
+                break
+    for field in ("client_id", "name"):
+        if field not in mapping:
+            raise ValueError(
+                f"{path} has no {field} column. A counterparty list needs at "
+                "least the client it belongs to and the counterparty's name; "
+                f"columns found: {', '.join(str(h) for h in headers)}")
+    report["columns"] = dict(mapping)
+
+    index = {h: i for i, h in enumerate(headers)}
+    out: list[dict[str, Any]] = []
+    skipped = 0
+    for row in data:
+        def get(field):
+            col = mapping.get(field)
+            if col is None:
+                return None
+            i = index[col]
+            return _clean(row[i]) if i < len(row) else None
+
+        name = get("name")
+        client = get("client_id")
+        if not name or not client:
+            skipped += 1
+            continue
+        rank = get("rank")
+        out.append({
+            "client_id": client,
+            "name": name,
+            "direction": _direction(get("direction")),
+            "rank": int(float(rank)) if rank not in (None, "") else None,
+            "amount": get("amount"),
+            "transactions": get("transactions"),
+        })
+    report["rows"] = len(out)
+    report["skipped (no client or no name)"] = skipped
+    report["clients"] = len({r["client_id"] for r in out})
+    unknown = sum(1 for r in out if r["direction"] == "counterparty")
+    if unknown:
+        report["warnings"].append(
+            f"{unknown} row(s) do not say whether the counterparty buys or "
+            "sells, so they are filed as 'counterparty'. A supplier counted "
+            "as a customer inverts the signal, so they are not guessed.")
+    if "direction" not in mapping:
+        report["notes"].append(
+            "no direction column -- every row is filed as 'counterparty'")
+    return out, report
+
+
+def print_counterparty_report(report: dict[str, Any]) -> None:
+    print(f"counterparties: {report['file']}")
+    print(f"  read as       {report['read as']}")
+    cols = report["columns"]
+    for field in ("client_id", "name", "direction", "rank", "amount"):
+        if field in cols:
+            print(f"  {field:<13} <- column '{cols[field]}'")
+    print(f"  rows          {report['rows']} "
+          f"for {report['clients']} client(s)")
+    if report.get("skipped (no client or no name)"):
+        print(f"  skipped       {report['skipped (no client or no name)']} "
+              "rows with no client or no name")
+    print("  note: these carry no CR number, so they are matched on the name "
+          "alone at a stricter bar, and every match is flagged for review")
+    for w in report["warnings"]:
+        print(f"  warning: {w}")
+    for n in report.get("notes", []):
+        print(f"  note: {n}")
+    print()
+
+
+def parties(customers: Iterable[dict[str, Any]] = (),
+            counterparties: Iterable[dict[str, Any]] = ()
+            ) -> list[dict[str, Any]]:
+    """The customer book and a counterparty list as one list to look up.
+
+    A client's own rows all share an empty party_key, so several
+    registrations for one borrower collapse onto the same match and the
+    strongest evidence wins -- the behaviour the book already had.
+    """
+    out: list[dict[str, Any]] = []
+    names: dict[str, str] = {}
+    for c in customers:
+        cid = c["customer_id"]
+        names.setdefault(cid, c.get("name") or "")
+        out.append({**c, "client_id": cid, "client_name": names[cid],
+                    "relation": "self", "party_name": c.get("name"),
+                    "party_key": "", "party_source": "book",
+                    "party_rank": None, "party_amount": None,
+                    "party_transactions": None})
+    for c in counterparties:
+        name = c.get("name")
+        out.append({
+            "client_id": c["client_id"],
+            "client_name": c.get("client_name") or names.get(c["client_id"]),
+            "name": name,
+            "name_ar": None,
+            "cr_number": None,          # narration names never carry one
+            "relation": c.get("direction") or "counterparty",
+            "party_name": name,
+            "party_key": canonical_key(name) or (name or "").upper(),
+            "party_source": "transactions",
+            "party_rank": c.get("rank"),
+            "party_amount": c.get("amount"),
+            "party_transactions": c.get("transactions"),
+        })
+    return out
+
+
+def match_parties(
+    party_rows: Iterable[dict[str, Any]],
+    companies: Iterable[Any],
+    *,
+    fuzzy_threshold: float = FUZZY_THRESHOLD,
+    translit_threshold: float = TRANSLIT_THRESHOLD,
+    txn_fuzzy_threshold: float = TXN_FUZZY_THRESHOLD,
+    txn_translit_threshold: float = TXN_TRANSLIT_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """One row per (client, relation, party, tender, role, company row)."""
+    party_rows = list(party_rows)
+    index = NameIndex(companies)
+
+    def key(p, comp):
+        return (p["client_id"], p["relation"], p["party_key"],
+                comp["tender_id"], comp["role"], comp["seq"])
+
+    def emit(p, comp, method, score):
+        from_txn = p.get("party_source") == "transactions"
+        return {
+            "client_id": p["client_id"],
+            "client_name": p.get("client_name"),
+            "relation": p["relation"],
+            "party_name": p.get("party_name"),
+            "party_key": p["party_key"],
+            "party_source": p.get("party_source"),
+            "party_rank": p.get("party_rank"),
+            "tender_id": comp["tender_id"],
+            "role": comp["role"],
+            "seq": comp["seq"],
+            "method": method,
+            "score": score,
+            # A name-only match is never confirmed, and a name lifted from a
+            # narration is never confirmed even when it matches exactly.
+            "needs_review": int(method in REVIEW_METHODS or from_txn),
+            "matched_name": _field(comp, "name"),
+            "matched_cr": _field(comp, "cr_number"),
+            # the names the first version of this file used
+            "customer_id": p["client_id"],
+            "customer_name": p.get("client_name"),
+        }
+
+    book = [p for p in party_rows if p.get("party_source") != "transactions"]
+    txn = [p for p in party_rows if p.get("party_source") == "transactions"]
+    rows = _run(book, index, key, emit, fuzzy_threshold, translit_threshold)
+    rows += _run(txn, index, key, emit, txn_fuzzy_threshold,
+                 txn_translit_threshold)
+    return rows
+
+
 def match_classified(
     customers: Iterable[dict[str, Any]],
     register: Iterable[Any],

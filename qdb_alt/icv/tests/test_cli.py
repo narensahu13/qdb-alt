@@ -112,21 +112,26 @@ class MatchCommand(Base):
         book = self.book([["CIF-1", "whatever", target.cr]])
         out_csv = str(self.dir / "matches.csv")
         code, out = run(cli.cmd_match, db=self.db, customers=book, sheet=None,
-                        out=out_csv, replace=False, fuzzy=0.92, translit=0.90)
+                        out=out_csv, replace=False, fuzzy=0.92, translit=0.90,
+                        asof=None, features=None, feature_months=60)
         self.assertEqual(code, 0)
         with open(out_csv, encoding="utf-8-sig") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["customer_id"], "CIF-1")
-        self.assertEqual(rows[0]["method"], "cr")
+        self.assertEqual(rows[0]["client_id"], "CIF-1")
+        self.assertEqual(rows[0]["match_method"], "cr")
         self.assertEqual(rows[0]["matched_name"], target.name)
         self.assertTrue(rows[0]["icv_score"])
-        self.assertEqual(rows[0]["status"], "Valid")
+        self.assertEqual(rows[0]["icv_status"], "Valid")
+        # the things the score is useless without
+        self.assertTrue(rows[0]["icv_first_certificate"])
+        self.assertTrue(rows[0]["icv_observations"])
 
     def test_matching_before_crawling_says_what_to_do(self):
         book = self.book([["CIF-1", "x", "100000"]])
         code, out = run(cli.cmd_match, db=self.db, customers=book, sheet=None,
-                        out=None, replace=False, fuzzy=0.92, translit=0.90)
+                        out=None, replace=False, fuzzy=0.92, translit=0.90,
+                        asof=None, features=None, feature_months=60)
         self.assertEqual(code, 1)
         self.assertIn("Run `crawl` first", out)
 
@@ -134,7 +139,8 @@ class MatchCommand(Base):
         self.crawl()
         book = self.book([["CIF-1", "x", self.companies[1].cr]])
         run(cli.cmd_match, db=self.db, customers=book, sheet=None, out=None,
-            replace=False, fuzzy=0.92, translit=0.90)
+            replace=False, fuzzy=0.92, translit=0.90, asof=None,
+            features=None, feature_months=60)
         s = Store(self.db)
         try:
             self.assertEqual(s.stats()["matches"], 1)

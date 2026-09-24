@@ -67,6 +67,38 @@ CR number first, then exact name, then fuzzy, then Arabic/Latin
 transliteration — the same ladder as Monaqasat, and every match records which
 method produced it so CR joins can be used as they are and the rest reviewed.
 
+### What comes out
+
+A score on its own is nearly useless, so the export carries the trajectory
+around it, all as at one date (`--asof`, default today):
+
+`icv_score` and `icv_score_date`, `icv_score_12m_ago`,
+`icv_score_change_12m`, and that change split into
+**`icv_organic_change_12m`** — what the company earned — and
+**`icv_policy_change_12m`** — what the rules handed everyone at once.
+`icv_first_certificate`, `icv_months_certified`, `icv_observations`,
+`icv_months_since_last_change`. Then the standing:
+`icv_status`, `icv_expiry_date`, `icv_days_to_expiry`. Then the cohort:
+`icv_industry_median` at the same date and `icv_vs_industry`, because 24%
+means nothing until you know the sector sits at 31%.
+
+```powershell
+python -m icv match --customers ..\..\customer-data\customers.csv ^
+    --out icv-matches.csv --features icv-client-months.csv --asof 2025-06-30
+```
+
+`--features` writes one row per client per month on the same point-in-time
+rule. Where a company held no certificate there is **no row**, not a zero: a
+company that was never certified is not a company with a bad score.
+
+`icv_standing_known` is 0 for any date before your first sweep. Status and
+expiry are not published as history, so they cannot be reconstructed — the
+column says so rather than back-filling today's status onto 2024.
+
+Counterparty names are not matched here. They have no CR, and unlike the
+tender register an ICV score attached to the wrong company would look
+perfectly plausible.
+
 **Keep the real book out of this repository.** `customer-data\` and
 `*.book.csv` are ignored; `sample/customers.csv` in the Monaqasat package is a
 five-row example. One borrower often needs several rows — a changed

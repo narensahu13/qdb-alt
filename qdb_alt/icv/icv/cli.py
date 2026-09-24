@@ -21,10 +21,12 @@ import shutil
 import sqlite3
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import fetch, parse
+from .features import build_client_months, client_rows
 from .fetch import Portal, PortalError
 from .match import (load_customers_report, match_suppliers, print_load_report,
                     summarise)
@@ -271,26 +273,48 @@ def cmd_match(args) -> int:
                               translit_threshold=args.translit)
     store.save_matches(matches, None, replace=args.replace)
     _table(summarise(matches).items())
+
+    raw_asof = getattr(args, "asof", None)
+    as_of = date.fromisoformat(raw_asof) if raw_asof else date.today()
+    names = {m["customer_id"]: m.get("customer_name") for m in matches}
     if args.out:
-        by_id = {c["id"]: c for c in companies}
-        with open(args.out, "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.writer(fh)
-            w.writerow(["customer_id", "customer_name", "company_id",
-                        "matched_name", "matched_cr", "method", "confidence",
-                        "icv_score", "status", "expiry_date", "industry"])
-            for m in matches:
-                c = by_id.get(m["company_id"], {})
-                w.writerow([m["customer_id"], m["customer_name"],
-                            m["company_id"], m["matched_name"],
-                            m["matched_cr"], m["method"],
-                            f"{m['confidence']:.3f}",
-                            c["total_score"] if c else "",
-                            c["status"] if c else "",
-                            c["expiry_date"] if c else "",
-                            c["industry"] if c else ""])
-        print(f"\nwrote {args.out}")
+        rows = client_rows(store, as_of)
+        for r in rows:
+            r["client_name"] = names.get(r["client_id"])
+        if rows:
+            _write_csv(args.out, rows)
+            print(f"\nwrote {args.out}: {len(rows)} row(s) as at {as_of}, "
+                  "with the score on that date, what it was a year before, "
+                  "how much of the move the company earned rather than was "
+                  "given, and where it sits in its own sector")
+            unknown = sum(1 for r in rows if not r["icv_standing_known"])
+            if unknown:
+                print(f"  {unknown} row(s) have no standing as at {as_of}: "
+                      "status and expiry are only known from the first sweep "
+                      "onwards, never for the past.")
+
+    if getattr(args, "features", None):
+        built = build_client_months(store, months=args.feature_months)
+        rows = [dict(r) for r in store.conn.execute(
+            "SELECT * FROM client_month ORDER BY client_id, as_of_month")]
+        _write_csv(args.features, rows)
+        print(f"wrote {args.features}: {built['rows']} client-months over "
+              f"{built['clients']} client(s), point-in-time")
     store.close()
     return 0
+
+
+def _write_csv(path: str, rows: list[dict]) -> None:
+    keys: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in keys:
+                keys.append(k)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
 
 
 TABLES = {
@@ -453,6 +477,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--replace", action="store_true")
     m.add_argument("--fuzzy", type=float, default=0.92)
     m.add_argument("--translit", type=float, default=0.90)
+    m.add_argument("--asof", help="read every score and standing as at this "
+                                  "date (YYYY-MM-DD), not as at today")
+    m.add_argument("--features",
+                   help="also write the client-by-month feature table here")
+    m.add_argument("--feature-months", type=int, default=60)
     m.set_defaults(func=cmd_match)
 
     e = sub.add_parser("export"); e.add_argument("--db", default=DEFAULT_DB)
