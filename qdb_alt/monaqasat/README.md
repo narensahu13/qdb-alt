@@ -160,6 +160,17 @@ Excel -- an `.xlsx` avoids encoding problems entirely:
 python -m monaqasat match --customers book.xlsx --sheet Customers
 ```
 
+**Keep the real book out of this repository.** `sample/customers.csv` is a
+five-row example and is committed; a real book put at that path would be
+committed too. `customer-data/` and `*.book.csv` are ignored, so
+`customer-data\book.xlsx` is a safe place for it, as is anywhere outside the
+tree.
+
+One customer often needs more than one row -- a CR that changed, a
+subsidiary, a branch with its own registration. Give each its own row under
+the same customer id: every row is matched, the results are filed under that
+one id, and a branch number like `29309/4` reaches the parent anyway.
+
 It needs a name column, a CR number column, or both; a customer id is
 optional. Common header variants are recognised -- `CIF No`, `Customer Name`,
 `C.R. No.`, `Commercial Registration Number` and so on -- and the command
