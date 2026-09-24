@@ -539,3 +539,129 @@ anywhere in the packed file.
   keep the sample they were written against (that is why `blob_dict` rows
   are never deleted), and new pages would compress a little worse until one
   is added. Not worth the machinery today.
+
+---
+
+# Follow-up, 24 September 2026
+
+One report from a real first run, and what it exposed.
+
+```
+$ python -m monaqasat crawl --kind awarded --max-hours 0.25
+  ... 459 listing pages, 0 detail pages, 9,178 tenders, 0 award rows
+$ python -m monaqasat match --customers sample\customers.csv --out matches.csv
+No company rows yet. Run `crawl` first.
+```
+
+Nothing crashed, no page failed, the numbers all went up -- and the run was
+useless, because everything a borrower is matched on lives on the per-tender
+pages that were never reached. Four fixes: one real, three about the tool
+saying what is happening.
+
+## 14. A budgeted run no longer spends all of it on listing pages
+
+**What happened.** `cmd_crawl` reads every listing page first, then fetches
+detail pages with whatever time is left. That ordering is right -- a tender's
+section has to be settled before its detail pages are worth fetching -- but
+on a *first* load Awarded alone is 1,212 listing pages, about half an hour at
+the 1.5 s delay. Any budget under that never reaches step 2. The store fills
+with tenders that have no winners, no bidders and no prices, `match` has
+nothing to join to, and no number in `stats` says so.
+
+It is specific to the first load (or a re-crawl after a long gap): once the
+sections are read, a nightly run spends a few minutes on listings and the
+rest on details, which is why it was not seen in the rehearsal.
+
+**Fix.** A run with `--max-hours` now splits it: `LISTING_SHARE = 0.6` to the
+listing pass, the rest to the detail pages. `_expired(args, "listings")`
+checks the earlier of the two deadlines, `_expired(args)` the run deadline,
+so only the listing loops stop early. If the detail queue empties before the
+clock does, the listing deadline is cleared and the listings carry on with
+what is left; if the listings finish inside their share, the details get
+everything that remains. Without `--max-hours` nothing changes.
+
+A 15-minute run at the 1.5 s delay is about 600 requests: 459 listing pages
+and nothing else before, roughly 360 listing and 240 detail pages now. The
+second number is the one that matters -- 240 companies pages is 240 tenders
+with winners and prices, on the first run instead of the fifth.
+
+**Tests.** `tests/test_lifecycle.TimeBudgetSplit` runs a budgeted crawl
+against a 2,000-tender fake site on a clock that only moves when a page is
+fetched, so the split is measured in requests and not in wall time:
+
+- a budgeted run always comes back with detail pages, and award rows in the
+  store (this is the test that fails on the old code)
+- the listings still get the larger share
+- the next run carries the first load on from where it stopped
+- a run with no budget is never cut short
+- `--pages 1-<held>` spends the whole run on details
+
+## 15. `match` now says which pages are missing
+
+**What happened.** With tenders but no company rows, `match` printed
+``No company rows yet. Run `crawl` first.`` -- which is what the person had
+just done, twice.
+
+**Fix.** When the store holds tenders but no company rows, it says that the
+companies pages are the ones carrying winners, bidders and prices, that a
+first load reads all the listing pages before any of them, and gives the
+command that spends a run on details instead:
+
+```
+python -m monaqasat crawl --kind awarded --pages 1-<deepest page held> --max-hours 1
+```
+
+`crawl` prints the same thing at the end of a run that read no detail page
+while some were queued. Both numbers come from the store, not from a guess.
+
+## 16. The duplicate-customer-id warning was wrong
+
+**What happened.** The load report warned `N duplicate customer id(s) --
+later rows overwrite earlier ones in matches`. A bank's book has repeated
+ids on purpose: a CR that changed, a subsidiary, a branch with its own
+registration. The warning said that work was being thrown away.
+
+It is not. `match_customers` walks every row and appends to the result, so
+each row is matched on its own and the results are filed under the one id.
+Two rows collide only when both land on the *same company row of the same
+tender*, and there the stronger evidence wins -- a CR match over a name
+match. In the book this came from, 1,433 rows over 1,032 ids, 343 customers
+with more than one row.
+
+**Fix.** It is now a note, not a warning, and it says what actually happens.
+`print_load_report` prints warnings as `warning:` and notes as `note:` --
+before, both printed as `note:`, so a real warning read like an aside.
+
+**Tests.** `tests/test_match.OneCustomerSeveralRows`: every row of a customer
+is matched, a branch CR (`29309/4`) reaches the parent, two rows on the same
+company row keep the CR match, and the load report calls the repeated id a
+note with an empty `warnings` list.
+
+## 17. The real book can no longer be committed by accident
+
+**What happened.** `sample/customers.csv` is a five-row example and is
+tracked. A real book dropped at that path -- the obvious thing to do, since
+it is the path in the README's example -- would be committed with the next
+`git add`.
+
+**Fix.** `/customer-data/` and `*.book.csv` are in `.gitignore`, and the
+README says to keep the book in `customer-data\` or outside the tree, plus
+why one customer often needs several rows. (Fix 13 already stopped `pack`
+from copying the `match` table into a shareable database.)
+
+## Checking it yourself
+
+```powershell
+cd qdb_alt\monaqasat
+python -m unittest discover -s tests -t .     # 249 tests, offline
+python -m unittest tests.test_lifecycle.TimeBudgetSplit -v
+python -m unittest tests.test_match.OneCustomerSeveralRows -v
+```
+
+To watch fix 14 fail without it, set `LISTING_SHARE = 1.0` in `cli.py` (that
+is the old behaviour: listings take the whole budget) and run
+`TimeBudgetSplit`. Two of the five fail --
+`test_a_budgeted_run_always_brings_back_some_detail_pages` with
+`0 not greater than 0`, and `test_the_next_run_carries_the_first_load_on`
+with `100 not greater than 100`, the second run having re-read the same
+listing pages as the first. Put `0.6` back and all five pass.
