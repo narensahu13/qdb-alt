@@ -17,3 +17,8 @@ logs/
 *.log
 .DS_Store
 Thumbs.db
+
+# Customer data never belongs in this repository. Keep the book here, or
+# anywhere outside the tree; sample/customers.csv is a five-row example.
+/customer-data/
+*.book.csv
