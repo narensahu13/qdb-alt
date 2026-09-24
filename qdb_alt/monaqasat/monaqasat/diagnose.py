@@ -13,8 +13,17 @@ guessing.
   3. a TLS version or cipher mismatch -- older server stacks reject what
      OpenSSL 3 offers by default
   4. the server declining non-browser clients outright
+  5. something on the path answering in the server's place and refusing --
+     a proxy returning 407, or the WAF's own page returned as HTTP 200
 
-Run `python -m monaqasat doctor` and read the verdict at the bottom.
+Case 5 is the one worth stating plainly: a blocked request still answers.
+requests raises nothing, so anything that treats "got a response" as success
+reports a healthy network while the crawler cannot fetch a single page.
+
+Run `python -m monaqasat doctor` and read the verdict at the bottom. It
+exits 0 when the site is reachable or the fix is yours to apply, 1 when the
+diagnosis is inconclusive, and 2 when the refusal is deliberate and there is
+nothing on this side to configure.
 """
 
 from __future__ import annotations
@@ -111,10 +120,61 @@ def ctx_system_store() -> ssl.SSLContext | None:
     return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
 
-def http_get(use_proxy: bool, verify=True, path: str = "/robots.txt"
-             ) -> tuple[bool, str]:
+BLOCK_STATUSES = {
+    401: "the server wants credentials",
+    403: "forbidden -- the site, or something in front of it, refused",
+    407: "the proxy requires authentication",
+    451: "blocked for legal reasons",
+    502: "the proxy could not reach the server",
+    511: "the network requires sign-in (a captive portal)",
+}
+
+
+def block_reason(status: int, headers, text: str, *,
+                 expect_text: bool = True) -> str:
+    """Why this answer is not the page we asked for; "" when it is.
+
+    A blocked request still answers. The WAF returns its own page with HTTP
+    200, a proxy returns 407 or an interstitial, and requests raises nothing
+    at all -- which is how `doctor` came to print "Everything works" on a
+    network where the crawler could not fetch a single page.
+    """
+    from .parse import looks_rejected
+
+    if looks_rejected(text):
+        return "the firewall's block page, served as HTTP 200"
+    if status in BLOCK_STATUSES:
+        return f"HTTP {status} -- {BLOCK_STATUSES[status]}"
+    if status != 200:
+        return f"HTTP {status}"
+    ctype = ""
+    try:
+        ctype = (headers.get("Content-Type") or "").lower()
+    except AttributeError:                          # a plain mapping is fine
+        ctype = str(headers or "").lower()
+    if expect_text and ("html" in ctype or text.lstrip().startswith("<")):
+        return ("HTTP 200, but the body is HTML where robots.txt should be "
+                "plain text -- something answered in the server's place")
+    return ""
+
+
+def who_answered(headers) -> str:
+    """Name the box that refused, when it identifies itself. IT needs this."""
+    for h in ("Via", "X-Squid-Error", "X-Cache", "Proxy-Agent", "Server"):
+        try:
+            value = headers.get(h)
+        except AttributeError:
+            return ""
+        if value:
+            return f"{h}: {str(value)[:48]}"
+    return ""
+
+
+def http_get(use_proxy: bool, verify=True, path: str = "/robots.txt",
+             host: str = HOST) -> tuple[bool, str, str]:
     """The layer the crawler actually uses.
 
+    Returns (reached the real server, detail, reason it was not reached).
     A raw socket handshake ignores proxy settings; requests does not. When
     the socket works and this does not, the proxy is the problem.
     """
@@ -124,12 +184,20 @@ def http_get(use_proxy: bool, verify=True, path: str = "/robots.txt"
     if not use_proxy:
         kwargs["proxies"] = {"http": None, "https": None}
     try:
-        r = requests.get(f"https://{HOST}{path}", **kwargs)
-        body = (r.text or "").strip().splitlines()
-        first = body[0][:40] if body else ""
-        return True, f"HTTP {r.status_code}  {len(r.content)}B  {first!r}"
+        r = requests.get(f"https://{host}{path}", **kwargs)
     except Exception as exc:                        # noqa: BLE001
-        return False, f"{type(exc).__name__}: {str(exc)[:110]}"
+        return False, f"{type(exc).__name__}: {str(exc)[:110]}", ""
+
+    text = r.text or ""
+    lines = text.strip().splitlines()
+    first = lines[0][:40] if lines else ""
+    reason = block_reason(r.status_code, r.headers, text,
+                          expect_text=path.endswith(".txt"))
+    detail = f"HTTP {r.status_code}  {len(r.content)}B  {first!r}"
+    if reason:
+        who = who_answered(r.headers)
+        detail += f"  -- {reason}" + (f"  [{who}]" if who else "")
+    return not reason, detail, reason
 
 
 def cert_issuer(host: str = HOST) -> str:
@@ -205,6 +273,11 @@ def proxies_in_play() -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 def run(host: str = HOST) -> int:
+    """Probe, then say what is wrong in one verdict.
+
+    Exit code: 0 reachable, or a fix you can apply here; 1 inconclusive;
+    2 a deliberate refusal, with nothing on this side to configure.
+    """
     print(f"monaqasat doctor -- {host}\n")
 
     print("environment")
@@ -264,10 +337,12 @@ def run(host: str = HOST) -> int:
           else "public CA -- you are talking to the real server")
 
     print("\nHTTP through requests (what the crawler uses)")
-    http_proxy_ok, http_proxy_detail = http_get(use_proxy=True)
+    http_proxy_ok, http_proxy_detail, http_proxy_reason = http_get(
+        use_proxy=True, host=host)
     _line("with system proxy", ("OK   " if http_proxy_ok else "fail ")
           + http_proxy_detail)
-    http_direct_ok, http_direct_detail = http_get(use_proxy=False)
+    http_direct_ok, http_direct_detail, http_direct_reason = http_get(
+        use_proxy=False, host=host)
     _line("proxy bypassed", ("OK   " if http_direct_ok else "fail ")
           + http_direct_detail)
 
@@ -281,12 +356,37 @@ def run(host: str = HOST) -> int:
 
     if http_direct_ok and not http_proxy_ok:
         print("  Direct works, going through the proxy does not.\n\n"
-              "  Fix: tell the crawler to bypass the proxy for this host --\n"
-              "      set NO_PROXY=monaqasat.mof.gov.qa\n"
+              f"  Fix: tell the crawler to bypass the proxy for this host --\n"
+              f"      set NO_PROXY={host}\n"
               "  or clear HTTP_PROXY/HTTPS_PROXY in this shell. If your\n"
               "  network requires the proxy for outbound traffic, ask IT for\n"
               "  the correct proxy URL including any authentication.")
         return 0
+
+    refusal = http_proxy_reason or http_direct_reason
+    if refusal:
+        # Something answered. That is not the same as the site working, and
+        # the old version of this report read it as exactly that.
+        print("  Something answered in the server's place and refused:\n"
+              f"    with the system proxy : "
+              f"{http_proxy_reason or http_proxy_detail}\n"
+              f"    proxy bypassed        : "
+              f"{http_direct_reason or http_direct_detail}\n")
+        if "407" in http_proxy_reason + http_direct_reason:
+            print("  HTTP 407 is the proxy asking for credentials. requests\n"
+                  "  does not use Windows single sign-on, so it cannot supply\n"
+                  "  them the way Chrome does. Ask IT either for a proxy URL\n"
+                  "  that carries authentication --\n"
+                  "      set HTTPS_PROXY=http://user:password@proxy:port\n"
+                  f"  -- or for {host} to be allowed without it.\n")
+        else:
+            print(f"  Ask IT whether outbound traffic to {host} is allowed\n"
+                  "  for scripts as well as browsers, and what proxy a script\n"
+                  "  should use.\n")
+        print("  This is a refusal, not a failure to connect. The handshakes\n"
+              "  above succeeded, so nothing here is a certificate problem --\n"
+              "  and a run that gets this far still fetches no pages.")
+        return 2
 
     if intercepted:
         print(f"  The certificate is signed by:\n    {issuer}\n\n"
