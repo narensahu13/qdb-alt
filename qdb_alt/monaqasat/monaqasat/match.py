@@ -172,7 +172,7 @@ def load_customers_report(path: str | Path, sheet: str | None = None
                           ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load a customer list and describe what was done to it."""
     path = Path(path)
-    report: dict[str, Any] = {"file": str(path), "warnings": []}
+    report: dict[str, Any] = {"file": str(path), "warnings": [], "notes": []}
 
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         headers, data = _read_xlsx(path, sheet)
@@ -252,10 +252,20 @@ def load_customers_report(path: str | Path, sheet: str | None = None
     if "cr_number" not in mapping:
         report["warnings"].append("no CR number column -- matching will rely "
                                   "on names alone, which is much weaker")
-    dupes = len(out) - len({r["customer_id"] for r in out})
+    ids = {r["customer_id"] for r in out}
+    dupes = len(out) - len(ids)
     if dupes:
-        report["warnings"].append(f"{dupes} duplicate customer id(s) -- later "
-                                  "rows overwrite earlier ones in matches")
+        # Not a problem, and usually deliberate: one borrower with several CR
+        # numbers (a changed registration, a subsidiary, a branch) gets a row
+        # each. Every row is matched and the results are filed under the one
+        # customer id. Only two rows landing on the very same company row of
+        # the same tender collide, and then the stronger evidence wins (a CR
+        # match over a name match).
+        report["notes"].append(
+            f"{len(ids)} customers over {len(out)} rows -- {dupes} extra "
+            "row(s) share a customer id. Each row is matched on its own and "
+            "the results are filed under that one id, so several CR numbers "
+            "for one borrower all count.")
     return out, report
 
 
@@ -286,7 +296,9 @@ def print_load_report(report: dict[str, Any]) -> None:
         print(f"  skipped       {report['skipped (no name, no CR)']} "
               "empty rows")
     for w in report["warnings"]:
-        print(f"  note: {w}")
+        print(f"  warning: {w}")
+    for n in report.get("notes", []):
+        print(f"  note: {n}")
     print()
 
 

@@ -170,8 +170,21 @@ ROLL_PAGES = 100
 SWEEP_DAYS = 7
 
 
-def _expired(args) -> bool:
+# A run with a time budget splits it: the listing pass gets this share, the
+# detail pages get the rest. Without it, a first load spends every run on
+# listing pages -- 1,212 of them for Awarded -- and the database holds
+# tenders with no winners, no prices and nothing to match a customer to for
+# days. If the listings finish early the details get the whole budget, and
+# if the details finish early the listings carry on with what is left.
+LISTING_SHARE = 0.6
+
+
+def _expired(args, phase: str = "") -> bool:
     deadline = getattr(args, "deadline", None)
+    if phase == "listings":
+        listing = getattr(args, "listing_deadline", None)
+        if listing is not None:
+            deadline = listing if deadline is None else min(deadline, listing)
     return deadline is not None and time.monotonic() >= deadline
 
 
@@ -179,6 +192,10 @@ def _set_deadline(args) -> None:
     hours = getattr(args, "max_hours", None)
     if hours and not getattr(args, "deadline", None):
         args.deadline = time.monotonic() + hours * 3600
+    deadline = getattr(args, "deadline", None)
+    if deadline is not None and getattr(args, "listing_deadline", None) is None:
+        left = max(deadline - time.monotonic(), 0.0)
+        args.listing_deadline = time.monotonic() + left * LISTING_SHARE
 
 
 def _opt(args, name, default):
@@ -323,7 +340,7 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
     if policy in ("sweep", "full"):
         clean = True
         for page in range(2, last + 1):
-            if _expired(args):
+            if _expired(args, "listings"):
                 return (f"time budget reached at page {page - 1} of {last}"
                         " -- not a full read, so nothing marked as gone")
             n, _ = visit(page)
@@ -380,7 +397,7 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
     below = past_floor(rows)
     caught_up = 1
     for page in pages:
-        if _expired(args):
+        if _expired(args, "listings"):
             return budget_out()
         if streak >= stop_after and below:
             break
@@ -407,7 +424,7 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
             print(f"  {kind}: first load incomplete -- continuing from page "
                   f"{rest[0]} to {rest[-1]}", flush=True)
         for page in rest:
-            if _expired(args):
+            if _expired(args, "listings"):
                 return budget_out()
             visit(page)
             if fails >= MAX_CONSECUTIVE_FAILS:
@@ -424,7 +441,7 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
         todo = [p for p in window if p not in visited]
         ok = True
         for page in todo:
-            if _expired(args):
+            if _expired(args, "listings"):
                 return budget_out()
             if visit(page)[0] is None:
                 ok = False
@@ -456,7 +473,7 @@ def _walk_listings(store, f, kind, args, run_id) -> str:
             for page in range(start, end + 1):
                 if page in visited:
                     continue
-                if _expired(args):
+                if _expired(args, "listings"):
                     store.update_section(kind, roll_next=page)
                     return outcome + f"; rolling pass paused at page {page}"
                 visit(page)
@@ -599,21 +616,52 @@ def cmd_crawl(args) -> int:
     kinds = _kinds(args.kind)
     run_id = store.start_run("crawl", args.kind, _mode(args))
 
-    # 1. every listing first, so each tender's state is settled
-    for i, kind in enumerate(kinds):
-        if i and _expired(args):
-            print("\n  time budget reached -- re-run to continue")
-            break
-        print(f"\n{kind}")
-        outcome = _walk_listings(store, f, kind, args, run_id)
-        print(f"  listings: {outcome}")
+    # 1. every listing first, so each tender's state is settled. On a run
+    #    with a time budget the listings get LISTING_SHARE of it, so that a
+    #    first load -- 1,212 pages for Awarded alone -- cannot use up every
+    #    run and leave the store with tenders but no winners.
+    def walk_listings() -> bool:
+        cut = False
+        for i, kind in enumerate(kinds):
+            if i and _expired(args, "listings"):
+                print("\n  time budget for listings reached -- the rest is "
+                      "read on the next run")
+                cut = True
+                break
+            print(f"\n{kind}")
+            outcome = _walk_listings(store, f, kind, args, run_id)
+            print(f"  listings: {outcome}")
+            cut = cut or "time budget" in outcome
+        return cut
+
+    cut_short = walk_listings()
 
     # 2. then the detail pages, most valuable first
     if not args.listings_only and not _expired(args):
         print("\ndetail pages")
         print(f"  {_fetch_details(store, f, kinds, args, run_id)}")
 
-    _print_run(store.finish_run(run_id))
+    # 3. if the details ran out of work before the clock did, spend what is
+    #    left finishing the listings the split cut short.
+    if cut_short and not _expired(args):
+        args.listing_deadline = None
+        print("\nback to the listings with the time left over")
+        walk_listings()
+
+    row = store.finish_run(run_id)
+    _print_run(row)
+    if not row["details"] and not args.listings_only:
+        waiting = len(store.detail_jobs(
+            kinds, tender_details=not args.no_details))
+        if waiting:
+            print(f"\nNo detail pages were read this run, so there are still "
+                  f"no winners or prices to match against. {waiting} page(s) "
+                  "are queued. Give the run longer (--max-hours 1), or keep "
+                  "it inside the listing pages already held so the time goes "
+                  "on details:\n"
+                  f"    python -m monaqasat crawl --kind {args.kind} "
+                  f"--pages 1-{store.section(kinds[0])['deepest_page'] or 1} "
+                  "--max-hours 0.25")
     left = store.left_every_list()
     if left:
         print(f"\n{len(left)} tender(s) have left every section read so far "
@@ -958,7 +1006,23 @@ def cmd_match(args) -> int:
     print_load_report(report)
     companies = store.companies()
     if not companies:
-        print("No company rows yet. Run `crawl` first.", file=sys.stderr)
+        held = store.stats()["tenders"]
+        if held:
+            deepest = max([r["deepest_page"] for r in store.conn.execute(
+                "SELECT deepest_page FROM section_state")] or [1]) or 1
+            print(f"\n{held} tenders are stored, but no companies page has "
+                  "been read yet, and those are the pages that carry the "
+                  "winners, the bidders and the prices -- there is nothing "
+                  "to match a customer to until some are in.\n"
+                  "A first load reads every listing page before it fetches "
+                  "any of them. To spend a run on the detail pages instead, "
+                  "keep it inside the listing pages already held:\n"
+                  f"    python -m monaqasat crawl --kind awarded "
+                  f"--pages 1-{deepest} --max-hours 1\n"
+                  "`stats` then shows award rows; run this command again "
+                  "after that.", file=sys.stderr)
+        else:
+            print("Nothing crawled yet. Run `crawl` first.", file=sys.stderr)
         return 1
 
     matches = match_customers(customers, companies,
