@@ -411,6 +411,51 @@ class TrueMatchesStillWork(unittest.TestCase):
                          ["NAJM ALFARID TRADING"])
 
 
+class OneCustomerSeveralRows(unittest.TestCase):
+    """A borrower often has more than one CR: the registration changed, or
+    a subsidiary or branch has its own. The book carries a row each, under
+    one customer id, and every row has to count."""
+
+    SITE = [_site_row("T1", "PARENT CO", "29309"),
+            _site_row("T2", "THE SUBSIDIARY", "55555"),
+            _site_row("T3", "SOMEONE ELSE", "77777")]
+
+    def test_every_row_of_a_customer_is_matched(self):
+        m = match_customers([_cust("CIF-1", "Parent", cr="29309"),
+                             _cust("CIF-1", "Subsidiary", cr="55555")],
+                            self.SITE)
+        self.assertEqual({x["tender_id"] for x in m}, {"T1", "T2"})
+        self.assertEqual({x["customer_id"] for x in m}, {"CIF-1"})
+
+    def test_a_branch_cr_still_reaches_the_parent(self):
+        m = match_customers([_cust("CIF-1", "Parent", cr="29309/4")],
+                            self.SITE)
+        self.assertEqual([x["matched_name"] for x in m], ["PARENT CO"])
+
+    def test_two_rows_on_the_same_company_keep_the_stronger_evidence(self):
+        m = match_customers([_cust("CIF-2", "x", cr="29309"),
+                             _cust("CIF-2", "PARENT CO")], self.SITE)
+        self.assertEqual([(x["tender_id"], x["method"]) for x in m],
+                         [("T1", "cr")])
+
+    def test_the_load_report_calls_it_a_note_not_a_warning(self):
+        import csv
+        from tempfile import TemporaryDirectory
+        from monaqasat.match import load_customers_report
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "book.csv"
+            with open(p, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["customer_id", "name", "cr_number"])
+                w.writerow(["CIF-1", "PARENT CO", "29309"])
+                w.writerow(["CIF-1", "THE SUBSIDIARY", "55555"])
+            rows, report = load_customers_report(p)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(report["warnings"], [])
+        self.assertTrue(any("share a customer id" in n
+                            for n in report["notes"]), report["notes"])
+
+
 class Classified(unittest.TestCase):
     def test_register_match_uses_the_same_rules(self):
         from monaqasat.match import match_classified

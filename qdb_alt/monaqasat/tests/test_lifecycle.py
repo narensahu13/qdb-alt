@@ -7,11 +7,15 @@ date, pages answered with the home page, and so on.
 """
 
 import unittest
+from unittest import mock
+
+from monaqasat import cli
 
 try:
-    from test_incremental import PER_PAGE, Harness, award_date
+    from test_incremental import PER_PAGE, Harness, _args, award_date
 except ImportError:                                   # run as tests.test_...
-    from tests.test_incremental import PER_PAGE, Harness, award_date
+    from tests.test_incremental import (PER_PAGE, Harness, _args,
+                                        award_date)
 
 AVAIL = "AvailableMinistriesTenders"
 CLOSED = "ClosedTenders"
@@ -283,6 +287,79 @@ class DetailPages(Harness):
             "SELECT COUNT(*) FROM company WHERE tender_id=? AND role='awarded'",
             (t,)).fetchone()[0], 1)
         s.close()
+
+
+class TimeBudgetSplit(Harness):
+    """A run with a time budget must not spend all of it on listing pages.
+
+    The first load of Awarded is 1,212 listing pages -- half an hour at the
+    polite delay -- and the winners, the bidders and the prices are all on
+    the per-tender pages that come after. A 15-minute run that reads nothing
+    but listings leaves a database with no company rows in it: nothing to
+    match a borrower against, and no way to tell from the numbers that the
+    run worked at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.site.publish(AWARD, 2000)                   # 100 listing pages
+        self.clock = {"t": 0.0}
+        inner = self.site.get
+
+        def ticking(rel):                                # 10 s per request
+            self.clock["t"] += 10
+            return inner(rel)
+
+        self.site.get = ticking
+
+    def budgeted(self, seconds: float, **kw):
+        """A crawl with `seconds` of budget on a clock that only moves when
+        the site is asked for a page."""
+        self.site.reset()
+        args = _args(db=self.db, kind="awarded",
+                     max_hours=seconds / 3600, **kw)
+        with mock.patch.object(cli.time, "monotonic",
+                               lambda: self.clock["t"]):
+            cli.cmd_crawl(args)
+        listing = sum(1 for r in self.site.requests if "Details/" not in r)
+        return listing, len(self.site.requests) - listing
+
+    def test_a_budgeted_run_always_brings_back_some_detail_pages(self):
+        listing, detail = self.budgeted(1000)
+        self.assertGreater(detail, 0, "a run that reads no detail page has "
+                                      "nothing anyone can match against")
+        self.assertLess(listing, 100, "listings did not take the whole run")
+        s = self.store()
+        self.assertGreater(s.stats()["award rows"], 0)
+        s.close()
+
+    def test_the_listings_get_the_larger_share(self):
+        listing, detail = self.budgeted(1000)
+        self.assertGreater(listing, detail,
+                           f"{listing} listing vs {detail} detail requests")
+
+    def test_the_next_run_carries_the_first_load_on(self):
+        first, _ = self.budgeted(1000)
+        second, _ = self.budgeted(1000)
+        s = self.store()
+        deepest = s.section("awarded")["deepest_page"]
+        s.close()
+        self.assertGreater(deepest, first, "the first load moved on")
+
+    def test_without_a_budget_nothing_is_cut_short(self):
+        self.crawl(listings_only=True)
+        s = self.store()
+        self.assertTrue(s.section("awarded")["reached_end"])
+        s.close()
+
+    def test_a_range_inside_what_is_held_spends_the_run_on_details(self):
+        self.budgeted(1000)                              # partial first load
+        s = self.store()
+        deepest = s.section("awarded")["deepest_page"]
+        s.close()
+        listing, detail = self.budgeted(1000, pages=f"1-{deepest}")
+        self.assertLess(listing, 10, "no listing pages to speak of")
+        self.assertGreater(detail, 50)
 
 
 class RunFrequency(Harness):
