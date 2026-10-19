@@ -15,16 +15,19 @@ posts, or changes anything on the portal -- every call is a read.
 from __future__ import annotations
 
 import time
+import re
 from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import urljoin
 
 import requests
 
 from . import parse
+from .normalize import cr_root
 
 BASE = "https://icv.tawteen.com.qa"
 LISTING_PATH = "/en-US/supplier-database-guest/"
 DETAIL_PATH = "/supplier-score-history/"
+API_ACCOUNTS = "/_api/accounts"
 
 DELAY = 1.5              # seconds between requests
 TIMEOUT = 60
@@ -96,8 +99,18 @@ class Portal:
         try:
             self.token = parse.verification_token(html)
         except parse.PageShapeError:
-            pass          # some pages carry no token; keep the previous one
+            # Since October 2026 the portal no longer puts the token in the
+            # page: its own script asks /_layout/tokenhtml for it. Do the same
+            # when we hold none yet; otherwise keep the one we have.
+            if not self.token:
+                self.refresh_token()
         return html
+
+    def refresh_token(self) -> str:
+        """Fetch a verification token the way the portal's own script does."""
+        r = self._send("GET", urljoin(self.base + "/", "_layout/tokenhtml"))
+        self.token = parse.verification_token(r.text)
+        return self.token
 
     def grid(self, cfg: parse.GridConfig, page: int = 1,
              page_size: int = 100, search: str = "",
@@ -162,6 +175,12 @@ class Portal:
         the CR number and the name concatenated, so a CR number finds the one
         company and a name finds anything containing it.
         """
+        try:
+            found = self.search_api(term, limit)
+        except PortalError:
+            found = None
+        if found is not None:
+            return found
         cfg = cfg or self.listing_config()
         payload = self.grid(cfg, page=1, page_size=limit, search=term)
         out = []
@@ -170,6 +189,43 @@ class Portal:
             if row:
                 out.append(row)
         return out
+
+    def search_api(self, term: str, limit: int = 20
+                   ) -> list[dict[str, Any]] | None:
+        """Look one company up through the portal's Web API (/_api/accounts).
+
+        Since October 2026 the supplier grid ignores its `search` field and
+        answers every term with the first page of the list; the page's own
+        script reads /_api/accounts instead. A CR number is matched exactly on
+        its root (29309/1 and 029309 both find 29309; QFC/00326 finds the QFC
+        company, never mainland 326); anything else is matched as part of the
+        name. Returns None when the API does not answer with JSON, so the
+        caller can fall back to the grid.
+        """
+        term = term.strip()
+        is_cr = re.fullmatch(r"(?i)(CR[-\s]?)?[\d٠-٩,./]+|QF[CZ]\s*/?\s*\d+", term)
+        root = cr_root(term) if is_cr else None
+        if root and root.isdigit():
+            flt = f"icv_commercialregistrationnumber eq '{root}'"
+        elif root:                                   # QFC/QFZ: stored zero-padded
+            flt = f"contains(icv_commercialregistrationnumber,'{root[3:]}')"
+        else:
+            flt = "contains(name,'{}')".format(term.replace("'", "''"))
+        r = self._send("GET", urljoin(self.base + "/", API_ACCOUNTS.lstrip("/")),
+                       params={"$select": parse.API_ACCOUNT_SELECT,
+                               "$expand": parse.API_ACCOUNT_EXPAND,
+                               "$filter": flt, "$top": str(limit)},
+                       headers={"Accept": "application/json"})
+        try:
+            values = r.json().get("value")
+        except (ValueError, AttributeError):
+            return None
+        if values is None:
+            return None
+        rows = [row for row in map(parse.api_company, values) if row]
+        if root:                       # contains() on QFC digits can over-match
+            rows = [row for row in rows if row["cr_root"] == root]
+        return rows
 
     # ------------------------------------------------------------- detail
 

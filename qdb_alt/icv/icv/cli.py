@@ -30,6 +30,7 @@ from .features import build_client_months, client_rows
 from .fetch import Portal, PortalError
 from .match import (load_customers_report, match_suppliers, print_load_report,
                     summarise)
+from .normalize import cr_root
 from .store import PACK_SKIP, SCHEMA, Store, today
 
 DEFAULT_DB = "icv.db"
@@ -182,13 +183,17 @@ def cmd_refresh(args) -> int:
         print(f"could not reach the portal: {exc}", file=sys.stderr)
         store.close()
         return 1
+    if args.cr:
+        # Keep only the company whose CR is the one asked for. Never fall back
+        # to whatever came back: a search that was ignored returns strangers,
+        # and storing them would put another company's score on the applicant.
+        want = cr_root(args.cr)
+        found = [f for f in found if f.get("cr_root") == want]
     if not found:
         print(f"nothing on the ICV register for {term!r}. That is itself an "
               "answer: the company is not a certified supplier today.")
         store.close()
         return 1
-    if len(found) > 1 and args.cr:
-        found = [f for f in found if f.get("cr_number") == args.cr] or found
     for row in found[: args.limit or len(found)]:
         store.see_company(row, seen_on)
         try:

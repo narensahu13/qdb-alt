@@ -192,6 +192,40 @@ def company(record: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+FORMATTED = "@OData.Community.Display.V1.FormattedValue"
+
+# Fields asked of the portal's Web API (/_api/accounts) for one supplier row.
+API_ACCOUNT_SELECT = ("accountid,name,icv_commercialregistrationnumber,icv_totalscore,"
+                      "icv_icvscoreexpirydate,icv_ismanufacturer,_icv_mainactivity_value,"
+                      "_icv_latestcertificate_value")
+API_ACCOUNT_EXPAND = "icv_LatestCertificate($select=statuscode)"
+
+
+def api_company(v: dict[str, Any]) -> dict[str, Any] | None:
+    """One supplier from the portal's Web API, in the same shape as company()."""
+    guid, name = v.get("accountid"), (v.get("name") or "").strip()
+    if not guid or not name:
+        return None
+    cr = (v.get("icv_commercialregistrationnumber") or "").strip() or None
+    cert = v.get("icv_LatestCertificate") or {}
+    expiry = v.get("icv_icvscoreexpirydate")
+    score = v.get("icv_totalscore")
+    return {
+        "id": guid.lower(),
+        "cr_number": cr,
+        "cr_root": cr_root(cr),
+        "name": name,
+        "name_norm": normalize_name(name),
+        "industry": v.get("_icv_mainactivity_value" + FORMATTED),
+        "total_score": float(score) if score is not None else None,
+        "status": cert.get("statuscode" + FORMATTED),
+        "status_code": cert.get("statuscode"),
+        "certificate_no": v.get("_icv_latestcertificate_value" + FORMATTED),
+        "expiry_date": expiry[:10] if expiry else None,
+        "manufacturer": v.get("icv_ismanufacturer"),
+    }
+
+
 def history(record: dict[str, Any]) -> dict[str, Any] | None:
     """One published change of score."""
     a = attributes(record)

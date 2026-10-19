@@ -105,6 +105,66 @@ class Refresh(Base):
             s.close()
 
 
+class PortalOfOctober2026(Base):
+    """The live portal since October 2026: the grid ignores `search`, and
+    companies are looked up through the Web API, /_api/accounts."""
+
+    def setUp(self):
+        super().setUp()
+        # Enough companies that the one asked for is not on the first page of
+        # the list -- as on the live register of ~6,900.
+        self.companies = sample(30)
+        self.portal = FakePortal(self.companies)
+        self.portal.grid_honours_search = False
+
+    def refresh(self, cr=None, name=None):
+        return run(cli.cmd_refresh, db=self.db, delay=0.0, timeout=5,
+                   no_system_trust=True, session=self.portal,
+                   cr=cr, name=name, limit=None, show=0)
+
+    def stored(self) -> list[str]:
+        s = Store(self.db)
+        try:
+            return [r[0] for r in s.conn.execute("SELECT name FROM company")]
+        finally:
+            s.close()
+
+    def test_a_cr_finds_that_company_and_only_it(self):
+        wanted = self.companies[25]
+        code, out = self.refresh(cr=wanted.cr)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stored(), [wanted.name])
+
+    def test_a_cr_in_any_format_finds_it(self):
+        wanted = self.companies[26]
+        code, _ = self.refresh(cr="0000" + wanted.cr + "/3")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stored(), [wanted.name])
+
+    def test_a_name_finds_it_too(self):
+        wanted = self.companies[27]
+        code, out = self.refresh(name=wanted.name)
+        self.assertEqual(code, 0)
+        self.assertIn(wanted.name, self.stored())
+
+    def test_without_the_web_api_an_ignored_search_stores_no_stranger(self):
+        # The grid answers the first page whatever was asked; none of it is
+        # the applicant, so nothing may be stored against them.
+        self.portal.web_api = False
+        code, out = self.refresh(cr="999999")
+        self.assertEqual(code, 1)
+        self.assertIn("not a certified supplier", out)
+        self.assertEqual(self.stored(), [])
+
+    def test_the_old_portal_still_works_through_the_grid(self):
+        self.portal.web_api = False
+        self.portal.grid_honours_search = True
+        wanted = self.companies[28]
+        code, _ = self.refresh(cr=wanted.cr)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stored(), [wanted.name])
+
+
 class MatchCommand(Base):
     def test_the_csv_carries_the_score_beside_the_customer(self):
         self.crawl()

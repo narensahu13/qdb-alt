@@ -245,5 +245,32 @@ class GoodsAndServices(Harness):
         s.close()
 
 
+class TokenNotInPage(Harness):
+    """Since October 2026 the live portal no longer embeds the verification
+    token in its pages; its own script fetches it from /_layout/tokenhtml."""
+
+    def setUp(self):
+        super().setUp()
+        self.portal.token_in_page = False
+
+    def token_requests(self) -> int:
+        return sum(1 for r in self.portal.requests if r.endswith("/_layout/tokenhtml"))
+
+    def test_the_crawl_still_loads_every_company(self):
+        self.crawl()
+        s = self.store()
+        self.assertEqual(s.stats()["companies"], len(self.companies))
+        s.close()
+
+    def test_the_token_is_asked_for_once_not_per_page(self):
+        self.crawl()
+        self.assertEqual(self.token_requests(), 1)
+
+    def test_a_token_in_the_page_still_wins(self):
+        self.portal.token_in_page = True
+        self.crawl()
+        self.assertEqual(self.token_requests(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,12 +13,22 @@ expensive way:
   * asking past the last page serves the last page again rather than nothing;
   * the signed grid configuration, not `entityId`, decides whose history is
     returned -- so a company's page must be fetched before its history.
+
+And the two changes the live portal made in October 2026, each behind a flag
+so the old behaviour can still be tested:
+
+  * pages no longer carry the verification token; /_layout/tokenhtml does
+    (`token_in_page`);
+  * the grid ignores its `search` field and answers every term with the first
+    page of the list (`grid_honours_search`); the page looks companies up
+    through the Web API, /_api/accounts, instead (`web_api`).
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -104,6 +114,25 @@ class Company:
                                "Yes" if self.manufacturer else "No"))
         return {"Id": self.guid, "EntityName": "account", "Attributes": attrs}
 
+    def api_record(self) -> dict[str, Any]:
+        """The row /_api/accounts returns, with the portal's annotations."""
+        f = "@OData.Community.Display.V1.FormattedValue"
+        rec = {
+            "accountid": self.guid, "name": self.name,
+            "icv_commercialregistrationnumber": self.cr,
+            "icv_totalscore": self.score, "icv_totalscore" + f: f"{self.score:.2f}",
+            "icv_icvscoreexpirydate": self.expiry,
+            "_icv_mainactivity_value": "act-" + self.industry,
+            "_icv_mainactivity_value" + f: self.industry,
+            "_icv_latestcertificate_value": "cert-" + self.certificate,
+            "_icv_latestcertificate_value" + f: self.certificate,
+            "icv_LatestCertificate": {"statuscode": self.status_code,
+                                      "statuscode" + f: self.status},
+        }
+        if self.manufacturer is not None:
+            rec["icv_ismanufacturer"] = self.manufacturer
+        return rec
+
     def history_records(self) -> list[dict[str, Any]]:
         out = []
         for h in sorted(self.history, key=lambda x: x["on"]):
@@ -166,14 +195,23 @@ class FakePortal:
         self.requests: list[str] = []
         self.fail_after: int | None = None     # simulate a dropped sweep
         self.headers: dict[str, str] = {}      # a requests.Session has these
+        # The live portal stopped embedding the token in its pages in
+        # October 2026; it serves it from /_layout/tokenhtml instead.
+        self.token_in_page = True
+        self.grid_honours_search = True
+        self.web_api = True
+
+    def _token_input(self) -> str:
+        if not self.token_in_page:
+            return ""
+        return f'<input name="__RequestVerificationToken" value="{self.TOKEN}"/>'
 
     # -- what the crawl sees -------------------------------------------
 
     def listing_html(self) -> str:
         layouts = _layouts("cfg:list", "", "icv_latestcertificate DESC",
                            "view-list", "list")
-        return (f'<html><body><input name="__RequestVerificationToken" '
-                f'value="{self.TOKEN}"/>'
+        return (f'<html><body>{self._token_input()}'
                 f'<div class="entity-grid" data-get-url="{GRID_URL}" '
                 f'data-ref-entity="account" data-selected-view="view-list" '
                 f'data-view-layouts="{layouts}"></div></body></html>')
@@ -185,8 +223,7 @@ class FakePortal:
                     f'data-ref-id="{guid}" data-ref-rel="{rel}" '
                     f'data-selected-view="{view}" data-view-layouts='
                     f'"{_layouts(secure, rel, sort, view, guid)}"></div>')
-        return (f'<html><body><input name="__RequestVerificationToken" '
-                f'value="{self.TOKEN}"/>'
+        return (f'<html><body>{self._token_input()}'
                 + grid(f"cfg:services:{guid}", REL_GOODS_SERVICES,
                        "icv_servicetype ASC", "view-serv")
                 + grid(f"cfg:goods:{guid}", REL_GOODS_SERVICES,
@@ -194,6 +231,20 @@ class FakePortal:
                 + grid(f"cfg:history:{guid}", REL_HISTORY,
                        "icv_posteddate ASC", "view-hist")
                 + '</body></html>')
+
+    def api_lookup(self, flt: str) -> list[dict[str, Any]]:
+        """The two filters the fetcher sends: an exact CR, or part of a field."""
+        eq = re.fullmatch(r"icv_commercialregistrationnumber eq '(.*)'", flt)
+        has = re.fullmatch(r"contains\((\w+),'(.*)'\)", flt)
+        out = []
+        for c in (self.companies[g] for g in self.order):
+            if eq and c.cr == eq.group(1):
+                out.append(c.api_record())
+            elif has:
+                field = c.name if has.group(1) == "name" else c.cr
+                if has.group(2).replace("''", "'").lower() in field.lower():
+                    out.append(c.api_record())
+        return out
 
     # -- the session interface ------------------------------------------
 
@@ -204,6 +255,15 @@ class FakePortal:
                 and len(self.requests) > self.fail_after):
             return _Response(503)
         if method == "GET":
+            if "/_api/accounts" in url:
+                if not self.web_api:
+                    return _Response(404)
+                return _Response(200, payload={"value": self.api_lookup(
+                    (kw.get("params") or {}).get("$filter", ""))},
+                    content_type="application/json")
+            if url.endswith("/_layout/tokenhtml"):
+                return _Response(200, f'<input name="__RequestVerificationToken" '
+                                      f'type="hidden" value="{self.TOKEN}" />')
             if "supplier-score-history" in url:
                 guid = url.split("id=")[1].split("&")[0]
                 if guid not in self.companies:
@@ -220,7 +280,7 @@ class FakePortal:
 
         if cfg == "cfg:list":
             guids = self.order
-            if search:
+            if search and self.grid_honours_search:
                 guids = [g for g in guids
                          if search.lower() in (self.companies[g].cr
                                                + self.companies[g].name).lower()]
