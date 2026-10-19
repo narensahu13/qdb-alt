@@ -1,0 +1,2 @@
+# The directory PDFs (~130 MB each) are downloaded here by `load`; they stay out of git.
+/data/

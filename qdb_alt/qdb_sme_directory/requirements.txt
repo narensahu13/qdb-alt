@@ -1,0 +1,5 @@
+requests>=2.31.0
+pymupdf>=1.24.0
+rapidfuzz>=3.0.0
+# trust the Windows certificate store on a QDB machine (see ../icv/README.md)
+truststore>=0.9.0
