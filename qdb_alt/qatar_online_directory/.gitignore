@@ -1,0 +1,4 @@
+# The cache database holds what was fetched from the site and the customer matches; it stays out of git.
+/qatar_online_directory.db
+# Feature files written by `match` are customer data.
+/*_features.csv
