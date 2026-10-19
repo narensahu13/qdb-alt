@@ -1,0 +1,11 @@
+{"value": [
+  {"Id": 1, "Title": "Sunrise Shipping Services W.L.L", "Title_Arabic": "شروق لخدمات الشحن",
+   "Category": ["Shipping Agencies;وكالات الشحن", "Clearing Agencies;وكالات التخليص"],
+   "Url": "http://www.sunrise-shipping.example", "Created": "2018-05-22T06:37:23Z", "Modified": "2018-07-11T08:21:05Z"},
+  {"Id": 2, "Title": "BLUE HARBOUR CLEARING", "Title_Arabic": null,
+   "Category": ["Clearing Agencies;وكالات التخليص"],
+   "Url": null, "Created": "2021-03-01T10:00:00Z", "Modified": "2021-03-01T10:00:00Z"},
+  {"Id": 3, "Title": "Northwind Waste Treatment Factory WLL", "Title_Arabic": null,
+   "Category": ["Waste Collection and Transportation;جمع ونقل النفايات"],
+   "Url": {"Url": "https://northwind.example", "Description": "Northwind"}, "Created": "2019-01-15T09:00:00Z", "Modified": "2020-02-01T09:00:00Z"}
+]}
