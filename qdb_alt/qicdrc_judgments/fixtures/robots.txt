@@ -1,0 +1,31 @@
+#
+# The rules of qicdrc.gov.qa's robots.txt (October 2026) that matter here,
+# without the site's comments.
+#
+User-agent: *
+Crawl-delay: 10
+Disallow: /core/
+Disallow: /admin/
+Disallow: /user/
+Disallow: /node/add/
+Disallow: /*/delete
+Disallow: /*/edit
+Disallow: /*?destination=
+Disallow: /*?page=*&
+Disallow: /*&page=
+Disallow: /*?sort=
+Disallow: /*&sort=
+Disallow: /*?order=
+Disallow: /*&order=
+Disallow: /*?search_api_fulltext=
+Disallow: /index.php/
+Disallow: /private-events/
+Allow: /core/*.css$
+Allow: /core/*.js$
+Allow: /themes/
+Allow: /sites/default/files/
+
+User-agent: Bingbot
+Disallow:
+
+Sitemap: https://www.qicdrc.gov.qa/sitemap.xml

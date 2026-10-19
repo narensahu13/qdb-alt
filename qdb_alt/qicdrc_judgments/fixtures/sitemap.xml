@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+ <url>
+  <loc>https://www.qicdrc.gov.qa/</loc>
+  <xhtml:link rel="alternate" hreflang="en" href="https://www.qicdrc.gov.qa/"/>
+  <xhtml:link rel="alternate" hreflang="ar" href="https://www.qicdrc.gov.qa/ar"/>
+  <changefreq>daily</changefreq>
+ </url>
+ <url>
+  <loc>https://www.qicdrc.gov.qa/judgments</loc>
+  <lastmod>2026-10-01T09:00:00+03:00</lastmod>
+ </url>
+ <url>
+  <loc>https://www.qicdrc.gov.qa/judgments/ctfic00992025-sunrise-dates-factory</loc>
+  <xhtml:link rel="alternate" hreflang="en" href="https://www.qicdrc.gov.qa/judgments/ctfic00992025-sunrise-dates-factory"/>
+  <xhtml:link rel="alternate" hreflang="ar" href="https://www.qicdrc.gov.qa/ar/judgments/ctfic00992025-sunrise-dates-factory"/>
+  <lastmod>2026-08-07T16:15:30+03:00</lastmod>
+ </url>
+ <url>
+  <loc>https://www.qicdrc.gov.qa/ar/judgments/ctfic00992025-sunrise-dates-factory</loc>
+  <xhtml:link rel="alternate" hreflang="en" href="https://www.qicdrc.gov.qa/judgments/ctfic00992025-sunrise-dates-factory"/>
+  <lastmod>2026-08-07T16:15:30+03:00</lastmod>
+ </url>
+ <url>
+  <loc>https://www.qicdrc.gov.qa/judgments/case-no-ctad00052025-2026-qic-3</loc>
+  <lastmod>2026-02-01T10:00:00+03:00</lastmod>
+ </url>
+ <url>
+  <loc>https://www.qicdrc.gov.qa/media-center/news/court-judgment-made-up-news-item</loc>
+  <lastmod>2026-02-02T10:00:00+03:00</lastmod>
+ </url>
+</urlset>
