@@ -1,0 +1,97 @@
+{
+  "meta": {
+    "goldenCopy": {"publishDate": "2026-10-19T00:00:00Z"},
+    "pagination": {"currentPage": 1, "perPage": 3, "from": 1, "to": 3, "total": 5, "lastPage": 2}
+  },
+  "links": {},
+  "data": [
+    {
+      "type": "lei-records",
+      "id": "2763000000000000AA01",
+      "attributes": {
+        "lei": "2763000000000000AA01",
+        "entity": {
+          "legalName": {"name": "SUNRISE DATES FACTORY W.L.L", "language": "en"},
+          "otherNames": [],
+          "transliteratedOtherNames": [],
+          "legalAddress": {"language": "en", "addressLines": ["Street 12"], "city": "Doha", "region": "QA-DA", "country": "QA", "postalCode": null},
+          "headquartersAddress": {"language": "en", "addressLines": ["Street 12"], "city": "Doha", "region": "QA-DA", "country": "QA", "postalCode": null},
+          "registeredAt": {"id": "RA000494", "other": null},
+          "registeredAs": "12345",
+          "jurisdiction": "QA",
+          "category": "GENERAL",
+          "legalForm": {"id": "ADV0", "other": null},
+          "status": "ACTIVE"
+        },
+        "registration": {
+          "initialRegistrationDate": "2020-03-01T08:00:00Z",
+          "lastUpdateDate": "2026-02-27T08:00:00Z",
+          "status": "ISSUED",
+          "nextRenewalDate": "2027-03-01T08:00:00Z",
+          "managingLou": "254900PMALKJRL1YGQ18",
+          "corroborationLevel": "FULLY_CORROBORATED"
+        }
+      }
+    },
+    {
+      "type": "lei-records",
+      "id": "2763000000000000AA02",
+      "attributes": {
+        "lei": "2763000000000000AA02",
+        "entity": {
+          "legalName": {"name": "مصنع نورثوند للبلاستيك", "language": "ar"},
+          "otherNames": [],
+          "transliteratedOtherNames": [
+            {"name": "NORTHWIND PLASTIC INDUSTRIES", "language": "ar", "type": "PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME"}
+          ],
+          "legalAddress": {"language": "en", "addressLines": ["Industrial Area"], "city": "Doha", "region": "QA-DA", "country": "QA", "postalCode": null},
+          "headquartersAddress": {"language": "en", "addressLines": ["Industrial Area"], "city": "Al Wakrah", "region": "QA-WA", "country": "QA", "postalCode": null},
+          "registeredAt": {"id": "RA000494", "other": null},
+          "registeredAs": "22222",
+          "jurisdiction": "QA",
+          "category": "GENERAL",
+          "legalForm": {"id": "W50Q", "other": null},
+          "status": "ACTIVE"
+        },
+        "registration": {
+          "initialRegistrationDate": "2021-06-15T08:00:00Z",
+          "lastUpdateDate": "2022-06-14T08:00:00Z",
+          "status": "LAPSED",
+          "nextRenewalDate": "2022-06-15T08:00:00Z",
+          "managingLou": "254900PMALKJRL1YGQ18",
+          "corroborationLevel": "FULLY_CORROBORATED"
+        }
+      }
+    },
+    {
+      "type": "lei-records",
+      "id": "2763000000000000AA03",
+      "attributes": {
+        "lei": "2763000000000000AA03",
+        "entity": {
+          "legalName": {"name": "GOLDEN HARBOUR TRADING", "language": "en"},
+          "otherNames": [
+            {"name": "GOLDEN HARBOUR", "language": "en", "type": "TRADING_OR_OPERATING_NAME"}
+          ],
+          "transliteratedOtherNames": [],
+          "legalAddress": {"language": "en", "addressLines": ["C Ring Road"], "city": "DOHA", "region": null, "country": "QA", "postalCode": null},
+          "headquartersAddress": {"language": "en", "addressLines": ["C Ring Road"], "city": "DOHA", "region": null, "country": "QA", "postalCode": null},
+          "registeredAt": {"id": "RA000494", "other": null},
+          "registeredAs": "00011111",
+          "jurisdiction": "QA",
+          "category": "GENERAL",
+          "legalForm": {"id": "ADV0", "other": null},
+          "status": "ACTIVE"
+        },
+        "registration": {
+          "initialRegistrationDate": "2018-01-10T08:00:00Z",
+          "lastUpdateDate": "2026-01-09T08:00:00Z",
+          "status": "ISSUED",
+          "nextRenewalDate": "2027-01-10T08:00:00Z",
+          "managingLou": "254900PMALKJRL1YGQ18",
+          "corroborationLevel": "FULLY_CORROBORATED"
+        }
+      }
+    }
+  ]
+}

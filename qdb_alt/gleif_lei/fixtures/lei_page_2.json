@@ -1,0 +1,65 @@
+{
+  "meta": {
+    "goldenCopy": {"publishDate": "2026-10-19T00:00:00Z"},
+    "pagination": {"currentPage": 2, "perPage": 3, "from": 4, "to": 5, "total": 5, "lastPage": 2}
+  },
+  "links": {},
+  "data": [
+    {
+      "type": "lei-records",
+      "id": "2763000000000000AA04",
+      "attributes": {
+        "lei": "2763000000000000AA04",
+        "entity": {
+          "legalName": {"name": "Blue Harbour Ice Factory LLC", "language": "en"},
+          "otherNames": [],
+          "transliteratedOtherNames": [],
+          "legalAddress": {"language": "en", "addressLines": ["QFC Tower"], "city": "Doha", "region": null, "country": "QA", "postalCode": null},
+          "headquartersAddress": {"language": "en", "addressLines": ["QFC Tower"], "city": "Doha", "region": null, "country": "QA", "postalCode": null},
+          "registeredAt": {"id": "RA000495", "other": null},
+          "registeredAs": "00326",
+          "jurisdiction": "QA",
+          "category": "GENERAL",
+          "legalForm": {"id": "8888", "other": "Limited Liability Company (QFC)"},
+          "status": "ACTIVE"
+        },
+        "registration": {
+          "initialRegistrationDate": "2023-09-01T08:00:00Z",
+          "lastUpdateDate": "2026-08-30T08:00:00Z",
+          "status": "ISSUED",
+          "nextRenewalDate": "2027-09-01T08:00:00Z",
+          "managingLou": "254900PMALKJRL1YGQ18",
+          "corroborationLevel": "FULLY_CORROBORATED"
+        }
+      }
+    },
+    {
+      "type": "lei-records",
+      "id": "2763000000000000AA05",
+      "attributes": {
+        "lei": "2763000000000000AA05",
+        "entity": {
+          "legalName": {"name": "SUNRISE DATES FACTORY", "language": "en"},
+          "otherNames": [],
+          "transliteratedOtherNames": [],
+          "legalAddress": {"language": "en", "addressLines": ["Street 12"], "city": "Doha", "region": null, "country": "QA", "postalCode": null},
+          "headquartersAddress": {"language": "en", "addressLines": ["Street 12"], "city": "Doha", "region": null, "country": "QA", "postalCode": null},
+          "registeredAt": {"id": "RA000494", "other": null},
+          "registeredAs": "12345",
+          "jurisdiction": "QA",
+          "category": "GENERAL",
+          "legalForm": {"id": "9999", "other": null},
+          "status": "ACTIVE"
+        },
+        "registration": {
+          "initialRegistrationDate": "2019-05-01T08:00:00Z",
+          "lastUpdateDate": "2026-09-01T08:00:00Z",
+          "status": "DUPLICATE",
+          "nextRenewalDate": "2020-05-01T08:00:00Z",
+          "managingLou": "254900PMALKJRL1YGQ18",
+          "corroborationLevel": "FULLY_CORROBORATED"
+        }
+      }
+    }
+  ]
+}
