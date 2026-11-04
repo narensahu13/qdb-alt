@@ -1,0 +1,31 @@
+User-agent: *
+Crawl-delay: 10
+
+Disallow: /_thumbs/
+Disallow: /admin/
+Disallow: /xml/
+Disallow: /themes/
+
+# Paths (clean URLs)
+Disallow: /comment/reply/
+Disallow: /node/add/
+Disallow: /search/
+Disallow: /user/login/
+# Paths (no clean URLs)
+Disallow: /?q=search/
+Disallow: /?q=user/login/
+
+Disallow: *.xlsx$
+Disallow: *.xls$
+
+# Begin block Bad-Robots from robots.txt
+User-agent: Mozilla
+Disallow:/
+User-agent: mozilla/5
+Disallow:/
+User-agent: Python-urllib
+Disallow:/
+User-agent: es
+Disallow:/
+User-agent: Wget
+Disallow:/

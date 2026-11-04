@@ -1,0 +1,31 @@
+User-agent: *
+Disallow: /ajax/*
+Disallow: /ajax*
+Disallow: /print*
+Disallow: /getRelatedArticles*
+Disallow: /getMostReadArticles*
+Disallow: /article_count/*
+Disallow: /get-menu-header*
+Disallow: /article.php*
+Disallow: /login-mgt
+Disallow: /*.php
+Disallow: /archive/*
+Disallow: /rss
+Disallow: /rssFeed/*
+Disallow: /widget/*
+Disallow: */page/*
+
+User-agent: Baiduspider
+Disallow: /
+User-agent: SemrushBot
+Disallow: /
+
+# Bing
+User-agent: bingbot
+Crawl-delay: 10
+
+User-agent: *
+Crawl-delay: 2
+
+Sitemap: https://www.gulf-times.com/sitemaps/sitemap_0.xml
+Sitemap: https://www.gulf-times.com/sitemaps/newsSitemap.xml
